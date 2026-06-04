@@ -3,6 +3,8 @@
 import logging
 import os
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,7 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wandb import add_wandb_tags
 from mjlab.utils.wrappers import VideoRecorder
+from mjlab.viewer import NativeMujocoViewer
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,10 @@ class TrainConfig:
   video_length: int = 200
   video_interval: int = 2000
   enable_nan_guard: bool = False
+  viewer: bool = False
+  """Enable real-time visualization during training (reduces training speed)."""
+  viewer_interval: int = 1
+  """Update viewer every N steps."""
   log_root: str = "logs/rsl_rl"
   """Root directory under which experiment logs are written."""
   torchrunx_log_dir: str | None = None
@@ -108,8 +115,24 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     print(f"[INFO] Logging experiment in directory: {log_dir}")
 
   env = ManagerBasedRlEnv(
-    cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
+    cfg=cfg.env, device=device, render_mode="human" if cfg.viewer else ("rgb_array" if cfg.video else None)
   )
+
+  viewer_thread = None
+  viewer_stop_event = threading.Event()
+
+  if cfg.viewer and rank == 0:
+    native_viewer = NativeMujocoViewer(env, lambda: None)
+    native_viewer.setup()
+
+    def viewer_tick_loop():
+      while not viewer_stop_event.is_set():
+        native_viewer.tick()
+        time.sleep(1.0 / 60.0)
+
+    viewer_thread = threading.Thread(target=viewer_tick_loop, daemon=True)
+    viewer_thread.start()
+    print("[INFO] Viewer enabled - visualization running in background thread.")
 
   log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
@@ -175,6 +198,10 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   runner.learn(
     num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
   )
+
+  if viewer_thread is not None:
+    viewer_stop_event.set()
+    viewer_thread.join(timeout=2.0)
 
   env.close()
 
