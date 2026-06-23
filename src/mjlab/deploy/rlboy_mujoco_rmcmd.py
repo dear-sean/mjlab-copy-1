@@ -1,215 +1,337 @@
 import argparse
 import time
+from pathlib import Path
 
 import mujoco
 import mujoco.viewer
 import numpy as np
-import torch
 import onnxruntime as ort
 
+NUM_ACTIONS = 20
+NUM_OBS = 72
+SIMULATION_DT = 0.005
+CONTROL_DECIMATION = 4
 
-def quat_rotate_inverse(quat, world_vec):
-    w, x, y, z = quat
-    q_vec = np.array([x, y, z])
-    t = np.cross(q_vec, world_vec) * 2.0
-    return world_vec + w * t + np.cross(q_vec, t)
+STIFFNESS = np.array(
+  [
+    16.3440649,
+    16.3440649,
+    16.3440649,
+    16.3440649,
+    8.2430936,
+    16.3440649,
+    16.3440649,
+    16.3440649,
+    16.3440649,
+    8.2430936,
+    8.2430936,
+    8.2430936,
+    1.6829649,
+    1.6829649,
+    1.6829649,
+    1.6829649,
+    1.6829649,
+    1.6829649,
+    1.6829649,
+    1.6829649,
+  ],
+  dtype=np.float32,
+)
+DAMPING = np.array(
+  [
+    1.0404955,
+    1.0404955,
+    1.0404955,
+    1.0404955,
+    0.5247716,
+    1.0404955,
+    1.0404955,
+    1.0404955,
+    1.0404955,
+    0.5247716,
+    0.5247716,
+    0.5247716,
+    0.1071409,
+    0.1071409,
+    0.1071409,
+    0.1071409,
+    0.1071409,
+    0.1071409,
+    0.1071409,
+    0.1071409,
+  ],
+  dtype=np.float32,
+)
+EFFORT_LIMITS = np.array(
+  [
+    20.0,
+    20.0,
+    20.0,
+    20.0,
+    11.0,
+    20.0,
+    20.0,
+    20.0,
+    20.0,
+    11.0,
+    11.0,
+    11.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+  ],
+  dtype=np.float32,
+)
+DEFAULT_ANGLES = np.array(
+  [
+    0.0,
+    0.0,
+    -0.2,
+    0.4,
+    -0.2,
+    0.0,
+    0.0,
+    -0.2,
+    0.4,
+    -0.2,
+    0.0,
+    0.0,
+    0.15,
+    0.3,
+    0.0,
+    0.9,
+    0.15,
+    -0.3,
+    0.0,
+    0.9,
+  ],
+  dtype=np.float32,
+)
+ACTION_SCALES = np.array(
+  [
+    0.3059214,
+    0.3059214,
+    0.3059214,
+    0.3059214,
+    0.3336126,
+    0.3059214,
+    0.3059214,
+    0.3059214,
+    0.3059214,
+    0.3336126,
+    0.3336126,
+    0.0,
+    0.4456421,
+    0.4456421,
+    0.4456421,
+    0.4456421,
+    0.4456421,
+    0.4456421,
+    0.4456421,
+    0.4456421,
+  ],
+  dtype=np.float32,
+)
 
 
-def projected_gravity(quat):
-    world_gravity = np.array([0.0, 0.0, -1.0])
-    return quat_rotate_inverse(quat, world_gravity)
+def quat_rotate_inverse(quat: np.ndarray, world_vec: np.ndarray) -> np.ndarray:
+  """Rotate a world-frame vector into the body frame."""
+  w = quat[0]
+  q_vec = quat[1:4]
+  t = 2.0 * np.cross(q_vec, world_vec)
+  return world_vec - w * t + np.cross(q_vec, t)
 
 
-def pd_control(target_q, q, kp, target_dq, dq, kd):
-    return (target_q - q) * kp + (target_dq - dq) * kd
+def projected_gravity(quat: np.ndarray) -> np.ndarray:
+  return quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0]))
+
+
+def pd_control(
+  target_q: np.ndarray,
+  q: np.ndarray,
+  kp: np.ndarray,
+  target_dq: np.ndarray,
+  dq: np.ndarray,
+  kd: np.ndarray,
+) -> np.ndarray:
+  return (target_q - q) * kp + (target_dq - dq) * kd
 
 
 class RandomCommandSampler:
-    """Random velocity command sampler matching Mjlab-Velocity-Flat-RL_BOY play mode."""
+  """Random velocity commands within the RL_BOY play-mode range."""
 
-    def __init__(self):
-        # Ranges matching rlboy_flat_env_cfg(play=True)
-        self.lin_vel_x_range = (-0.5, 0.5)
-        self.lin_vel_y_range = (-0.5, 0.5)
-        self.ang_vel_z_range = (-0.5, 0.5)
-        # Resampling time range (seconds)
-        self.resampling_time_range = (3.0, 8.0)
-        self._next_resample_time = 0.0
-        self._current_cmd = np.zeros(3, dtype=np.float32)
+  def __init__(self) -> None:
+    self.lin_vel_x_range = (-1.0, 1.5)
+    self.lin_vel_y_range = (-1, 1)
+    self.ang_vel_z_range = (-0.8, 0.8)
+    self.resampling_time_range = (3.0, 8.0)
+    self._next_resample_time = 0.0
+    self._current_cmd = np.zeros(3, dtype=np.float32)
 
-    def start(self):
-        print("\n=== Random Command Sampler ===")
-        print(f"lin_vel_x: {self.lin_vel_x_range}")
-        print(f"lin_vel_y: {self.lin_vel_y_range}")
-        print(f"ang_vel_z: {self.ang_vel_z_range}")
-        print(f"resampling every {self.resampling_time_range[0]}-{self.resampling_time_range[1]}s")
-        print("=========================\n")
+  def start(self) -> None:
+    print("\n=== Random Command Sampler ===")
+    print(f"lin_vel_x: {self.lin_vel_x_range}")
+    print(f"lin_vel_y: {self.lin_vel_y_range}")
+    print(f"ang_vel_z: {self.ang_vel_z_range}")
+    print(
+      "resampling every "
+      f"{self.resampling_time_range[0]}-{self.resampling_time_range[1]}s"
+    )
+    print("==============================\n")
 
-    def _resample(self):
-        self._current_cmd[0] = np.random.uniform(*self.lin_vel_x_range)
-        self._current_cmd[1] = np.random.uniform(*self.lin_vel_y_range)
-        self._current_cmd[2] = np.random.uniform(*self.ang_vel_z_range)
+  def _resample(self) -> None:
+    self._current_cmd[0] = np.random.uniform(*self.lin_vel_x_range)
+    self._current_cmd[1] = np.random.uniform(*self.lin_vel_y_range)
+    self._current_cmd[2] = np.random.uniform(*self.ang_vel_z_range)
 
-    def update(self, simulation_time):
-        if simulation_time >= self._next_resample_time:
-            self._resample()
-            self._next_resample_time = simulation_time + np.random.uniform(
-                *self.resampling_time_range
-            )
+  def update(self, simulation_time: float) -> None:
+    if simulation_time >= self._next_resample_time:
+      self._resample()
+      self._next_resample_time = simulation_time + np.random.uniform(
+        *self.resampling_time_range
+      )
 
-    def get_command(self):
-        return self._current_cmd.copy()
+  def get_command(self) -> np.ndarray:
+    return self._current_cmd.copy()
 
 
-def wrap_to_pi(angle):
-    return np.arctan2(np.sin(angle), np.cos(angle))
+def _static_dim(shape: list[int | str | None], axis: int) -> int | None:
+  dim = shape[axis]
+  return dim if isinstance(dim, int) else None
+
+
+def load_policy(policy_path: Path) -> tuple[ort.InferenceSession, str, str]:
+  if policy_path.suffix.lower() != ".onnx":
+    raise ValueError(f"Expected an ONNX policy, got: {policy_path}")
+
+  policy = ort.InferenceSession(str(policy_path))
+  policy_input = policy.get_inputs()[0]
+  policy_output = policy.get_outputs()[0]
+  input_dim = _static_dim(policy_input.shape, -1)
+  output_dim = _static_dim(policy_output.shape, -1)
+  if input_dim is not None and input_dim != NUM_OBS:
+    raise ValueError(
+      f"Policy expects {input_dim} observations, but this task requires {NUM_OBS}."
+    )
+  if output_dim is not None and output_dim != NUM_ACTIONS:
+    raise ValueError(
+      f"Policy outputs {output_dim} actions, but this task requires {NUM_ACTIONS}."
+    )
+
+  print(f"Loaded ONNX policy from {policy_path}")
+  return policy, policy_input.name, policy_output.name
+
+
+def reset_to_training_pose(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+  mujoco.mj_resetData(model, data)
+  data.qpos[:3] = (0.0, 0.0, 0.41)
+  data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+  data.qpos[7:] = DEFAULT_ANGLES
+  data.qvel[:] = 0.0
+  data.ctrl[:] = 0.0
+  mujoco.mj_forward(model, data)
+
+
+def build_observation(
+  data: mujoco.MjData,
+  action: np.ndarray,
+  command: np.ndarray,
+) -> np.ndarray:
+  quat = data.qpos[3:7]
+  base_lin_vel = quat_rotate_inverse(quat, data.qvel[0:3])
+  # MuJoCo free-joint angular velocity is already expressed in the body frame.
+  base_ang_vel = data.qvel[3:6]
+  gravity_orientation = projected_gravity(quat)
+  joint_pos = data.qpos[7:] - DEFAULT_ANGLES
+  joint_vel = data.qvel[6:]
+  return np.concatenate(
+    (
+      base_lin_vel,
+      base_ang_vel,
+      gravity_orientation,
+      joint_pos,
+      joint_vel,
+      action,
+      command,
+    ),
+    dtype=np.float32,
+  )
+
+
+def main() -> None:
+  repo_root = Path(__file__).resolve().parents[3]
+  default_xml = repo_root / "src/mjlab/asset_zoo/robots/RL_BOY/RLBOY2sim.xml"
+
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--xml-path", type=Path, default=default_xml)
+  parser.add_argument("--policy-path", type=Path, required=True)
+  args = parser.parse_args()
+
+  model = mujoco.MjModel.from_xml_path(str(args.xml_path))
+  data = mujoco.MjData(model)
+  model.opt.timestep = SIMULATION_DT
+  if model.nu != NUM_ACTIONS or model.nq != NUM_ACTIONS + 7:
+    raise ValueError(
+      f"Unexpected model dimensions: nq={model.nq}, nu={model.nu}; "
+      f"expected nq={NUM_ACTIONS + 7}, nu={NUM_ACTIONS}."
+    )
+
+  policy, input_name, output_name = load_policy(args.policy_path)
+  reset_to_training_pose(model, data)
+
+  command = np.zeros(3, dtype=np.float32)
+  action = np.zeros(NUM_ACTIONS, dtype=np.float32)
+  target_dof_pos = DEFAULT_ANGLES.copy()
+  target_dof_vel = np.zeros(NUM_ACTIONS, dtype=np.float32)
+  counter = 0
+
+  command_sampler = RandomCommandSampler()
+  command_sampler.start()
+
+  with mujoco.viewer.launch_passive(model, data) as viewer:
+    while viewer.is_running():
+      step_start = time.time()
+
+      torque = pd_control(
+        target_dof_pos,
+        data.qpos[7:],
+        STIFFNESS,
+        target_dof_vel,
+        data.qvel[6:],
+        DAMPING,
+      )
+      data.ctrl[:] = np.clip(torque, -EFFORT_LIMITS, EFFORT_LIMITS)
+      mujoco.mj_step(model, data)
+
+      counter += 1
+      if counter % CONTROL_DECIMATION == 0:
+        command_sampler.update(data.time)
+        command[:] = command_sampler.get_command()
+
+        if counter % 400 == 0:
+          print(f"cmd: [{command[0]:+.2f}, {command[1]:+.2f}, {command[2]:+.2f}]")
+
+        observation = build_observation(data, action, command)
+        # The mjlab-exported ONNX graph already contains the observation normalizer.
+        policy_output = policy.run(
+          [output_name],
+          {input_name: observation[None, :]},
+        )[0]
+        action = np.asarray(policy_output, dtype=np.float32).reshape(-1)
+        if action.shape != (NUM_ACTIONS,):
+          raise ValueError(f"Unexpected policy output shape: {action.shape}")
+        target_dof_pos = DEFAULT_ANGLES + action * ACTION_SCALES
+
+      viewer.sync()
+      time_until_next_step = model.opt.timestep - (time.time() - step_start)
+      if time_until_next_step > 0:
+        time.sleep(time_until_next_step)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--xml-path", type=str,
-                        default="/home/rx03116/GithubItems/mjlab/src/mjlab/asset_zoo/robots/RL_BOY/RLBOY2sim.xml")
-    parser.add_argument("--policy-path", type=str,
-                        default="/home/rx03116/GithubItems/mjlab/logs/rsl_rl/rlboy_velocity/2026-06-16_15-43-59/model_3100.pt")
-    args = parser.parse_args()
-
-    simulation_dt = 0.005
-    control_decimation = 4
-
-    STIFFNESS_LIST = [
-        16.34, 16.34, 16.34, 16.34, 8.241,
-        16.34, 16.34, 16.34, 16.34, 8.241,
-        8.241, 8.241,
-        1.683, 1.683, 1.683, 1.683,
-        1.683, 1.683, 1.683, 1.683,
-    ]
-    kps = np.array(STIFFNESS_LIST, dtype=np.float32)
-    DAMPING_LIST = [
-        1.045, 1.045, 1.045, 1.045, 0.5256,
-        1.045, 1.045, 1.045, 1.045, 0.5256,
-        0.5256, 0.5256,
-        0.1069, 0.1069, 0.1069, 0.1069,
-        0.1069, 0.1069, 0.1069, 0.1069,
-    ]
-    kds = np.array(DAMPING_LIST, dtype=np.float32)
-    JOINT_POS_LIST = [
-        0, 0, -0.2, 0.4, -0.2,
-        0, 0, -0.2, 0.4, -0.2,
-        0, 0,
-        0.15, 0.3, 0, 0.9,
-        0.15, -0.3, 0, 0.9,
-    ]
-    ACTION_SCALE_LIST = [
-        0.306, 0.306, 0.306, 0.306, 0.334,
-        0.306, 0.306, 0.306, 0.306, 0.334,
-        0.334, 0,
-        0.445, 0.445, 0.445, 0.445,
-        0.445, 0.445, 0.445, 0.445,
-    ]
-    action_scales = np.array(ACTION_SCALE_LIST, dtype=np.float32)
-    default_angles = np.array(JOINT_POS_LIST, dtype=np.float32)
-
-    num_actions = 20
-    num_obs = 72
-    cmd = np.array([0, 0, 0], dtype=np.float32)
-
-    action = np.zeros(num_actions, dtype=np.float32)
-    target_dof_pos = default_angles.copy()
-    obs = np.zeros(num_obs, dtype=np.float32)
-    counter = 0
-
-    xml_path = args.xml_path
-    policy_path = args.policy_path
-
-    m = mujoco.MjModel.from_xml_path(xml_path)
-    d = mujoco.MjData(m)
-    m.opt.timestep = simulation_dt
-
-    # 根据 policy 文件后缀自动选择推理后端：.onnx → ONNX Runtime, .pt → TorchScript JIT
-    suffix = policy_path.lower().rsplit(".", 1)[-1]
-    if suffix == "onnx":
-      policy = ort.InferenceSession(policy_path)
-      input_name = policy.get_inputs()[0].name
-      output_name = policy.get_outputs()[0].name
-      print(f"Loaded ONNX policy from {policy_path}")
-      import onnx
-      model = onnx.load(policy_path)
-      for prop in model.metadata_props:
-        print(f"{prop.key}: {prop.value}")
-    elif suffix == "pt":
-      policy = torch.jit.load(policy_path)
-      policy.eval()
-      print(f"Loaded TorchScript policy from {policy_path}")
-    else:
-      raise ValueError(
-        f"Unsupported policy format '.{suffix}' at {policy_path}. "
-        "Expected '.onnx' (ONNX Runtime) or '.pt' (TorchScript JIT)."
-      )
-
-    # 启动随机命令采样器
-    cmd_sampler = RandomCommandSampler()
-    cmd_sampler.start()
-
-    with mujoco.viewer.launch_passive(m, d) as viewer:
-            start = time.time()
-            while viewer.is_running():
-                step_start = time.time()
-                tau = pd_control(
-                    target_dof_pos, d.qpos[7:], kps, np.zeros_like(kds), d.qvel[6:], kds
-                )
-                d.ctrl[:] = tau
-                mujoco.mj_step(m, d)
-
-                counter += 1
-                if counter % control_decimation == 0:
-                    simulation_time = time.time() - start
-                    cmd_sampler.update(simulation_time)
-                    cmd[:] = cmd_sampler.get_command()
-
-                    if counter % 400 == 0:
-                        print(
-                            f"cmd: [{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}]"
-                        )
-
-                    quat = d.qpos[3:7]
-                    world_lin_vel = d.qvel[0:3]
-                    base_lin_vel = quat_rotate_inverse(quat, world_lin_vel)
-                    world_ang_vel = d.qvel[3:6]
-                    base_ang_vel = quat_rotate_inverse(quat, world_ang_vel)
-                    gravity_orientation = projected_gravity(quat)
-                    qj = d.qpos[7:]
-                    joint_pos = qj - default_angles
-                    dqj = d.qvel[6:]
-                    joint_vel = dqj
-
-                    idx = 0
-                    obs[idx : idx + 3] = base_lin_vel
-                    idx += 3
-                    obs[idx : idx + 3] = base_ang_vel
-                    idx += 3
-                    obs[idx : idx + 3] = gravity_orientation
-                    idx += 3
-                    obs[idx : idx + num_actions] = joint_pos
-                    idx += num_actions
-                    obs[idx : idx + num_actions] = joint_vel
-                    idx += num_actions
-                    obs[idx : idx + num_actions] = action
-                    idx += num_actions
-                    obs[idx : idx + 3] = cmd
-                    idx += 3
-
-                    obs_tensor = torch.from_numpy(obs).unsqueeze(0)
-
-                    if suffix == "onnx":
-                        action = policy.run([output_name], {input_name: obs_tensor.numpy()})[0]
-                        action = np.asarray(action).reshape(-1)
-                    else:  # "pt" → TorchScript
-                        action = policy(obs_tensor).detach().numpy().squeeze()
-
-                    target_dof_pos = default_angles + action * action_scales
-
-                viewer.sync()
-
-                time_until_next_step = m.opt.timestep - (time.time() - step_start)
-                if time_until_next_step > 0:
-                    time.sleep(time_until_next_step)
+  main()

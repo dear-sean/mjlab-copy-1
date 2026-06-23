@@ -283,8 +283,7 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # 定制速度指令课程学习
   # 从小范围开始，逐步提升线速度与角速度指令范围
-  # step 单位为环境步(decimation 后的步进), 24 = 4096 envs 跑一个 iteration 的近似步数
-  # 经验值参考: 0, ~120k, ~300k, ~600k 步切换
+
   cfg.curriculum["command_vel"] = CurriculumTermCfg(
     func=mdp.commands_vel,
     params={
@@ -301,7 +300,7 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
         # 阶段 1: 提升 x 方向速度上限
         {
-          "step": 5000 * 24,
+          "step": 2000 * 24,
           "lin_vel_x": (-1.0, 1.2),
           "lin_vel_y": (-0.5, 0.5),
           "ang_vel_z": (-0.6, 0.6),
@@ -309,7 +308,7 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
         # 阶段 2: 进一步提速并扩大侧向与偏航
         {
-          "step": 10000 * 24,
+          "step": 4000 * 24,
           "lin_vel_x": (-1.5, 1.8),
           "lin_vel_y": (-0.7, 0.7),
           "ang_vel_z": (-0.8, 0.8),
@@ -317,7 +316,7 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
         # 阶段 3: 接近最终能力上限
         {
-          "step": 20000 * 24,
+          "step": 8000 * 24,
           "lin_vel_x": (-2.0, 2.5),
           "lin_vel_y": (-1.0, 1.0),
           "ang_vel_z": (-1.0, 1.0),
