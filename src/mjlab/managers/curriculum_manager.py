@@ -23,7 +23,8 @@ class CurriculumTermCfg(ManagerTermBaseCfg):
   curriculum learning strategies (e.g., gradually increasing task difficulty).
   """
 
-  pass
+  log: bool = True
+  """Whether to include this term in ``Curriculum/*`` logs."""
 
 
 class CurriculumManager(ManagerBase):
@@ -77,7 +78,14 @@ class CurriculumManager(ManagerBase):
     self, env_idx: int
   ) -> Sequence[tuple[str, Sequence[float]]]:
     terms = []
-    for term_name, term_state in self._curriculum_state.items():
+    for term_name, term_state, term_cfg in zip(
+      self._curriculum_state.keys(),
+      self._curriculum_state.values(),
+      self._term_cfgs,
+      strict=True,
+    ):
+      if not term_cfg.log:
+        continue
       if term_state is not None:
         data = []
         if isinstance(term_state, dict):
@@ -94,7 +102,14 @@ class CurriculumManager(ManagerBase):
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> dict[str, float]:
     extras = {}
-    for term_name, term_state in self._curriculum_state.items():
+    for term_name, term_state, term_cfg in zip(
+      self._curriculum_state.keys(),
+      self._curriculum_state.values(),
+      self._term_cfgs,
+      strict=True,
+    ):
+      if not term_cfg.log:
+        continue
       if term_state is not None:
         if isinstance(term_state, dict):
           for key, value in term_state.items():

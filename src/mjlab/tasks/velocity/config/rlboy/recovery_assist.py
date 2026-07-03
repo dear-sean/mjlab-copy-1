@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -10,6 +12,7 @@ import torch
 from mjlab.envs import mdp as envs_mdp
 from mjlab.managers.event_manager import RecomputeLevel, requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.string import resolve_expr
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
@@ -43,35 +46,151 @@ class RlBoyRecoveryAssist:
     self._env = env
     self._asset: Entity = env.scene[params["asset_cfg"].name]
     self._body_ids = params["asset_cfg"].body_ids
-    self._command_name: str = params["command_name"]
     self._poses: list[dict[str, tuple[float, ...]]] = params["poses"]
-    self._recovery_probability: float = params["recovery_probability"]
-    self._force_levels = torch.tensor(
-      params["force_levels"], device=env.device, dtype=torch.float32
+    self._recovery_stage_probabilities: tuple[float, float, float] = params[
+      "recovery_stage_probabilities"
+    ]
+    self._post_stage_recovery_probability: float = params[
+      "post_stage_recovery_probability"
+    ]
+    self._low_force_recovery_probability: float = params[
+      "low_force_recovery_probability"
+    ]
+    self._recovery_probability_limits: tuple[float, float] = params[
+      "recovery_probability_limits"
+    ]
+    self._recovery_probability_feedback_gain: float = params[
+      "recovery_probability_feedback_gain"
+    ]
+    self._recovery_probability_smoothing: float = params[
+      "recovery_probability_smoothing"
+    ]
+    self._recovery_probability_min_attempts: int = params[
+      "recovery_probability_min_attempts"
+    ]
+    self._angle_noise_ramp_attempts: int = params["angle_noise_ramp_attempts"]
+    self._stage_three_weights = torch.tensor(
+      params["stage_three_weights"], device=env.device, dtype=torch.float32
+    )
+    self._force_ranges = torch.tensor(
+      params["force_ranges"], device=env.device, dtype=torch.float32
     )
     self._upright_height: float = params["upright_height"]
     self._upright_angle: float = params["upright_angle"]
-    self._ramp_duration_s: float = params["ramp_duration_s"]
-    self._independent_hold_s: float = params["independent_hold_s"]
+    self._fall_height: float = params["fall_height"]
+    self._fall_angle: float = params["fall_angle"]
+    self._fall_confirm_s: float = params["fall_confirm_s"]
+    self._upright_hold_s: float = params["upright_hold_s"]
+    self._force_ramp_up_s: float = params["force_ramp_up_s"]
+    self._force_ramp_down_s: float = params["force_ramp_down_s"]
     self._recovery_timeout_s: float = params["recovery_timeout_s"]
+    self._root_height_range: tuple[float, float] = params["root_height_range"]
+    self._root_lin_vel_range: tuple[float, float] = params["root_lin_vel_range"]
+    self._root_ang_vel_range: tuple[float, float] = params["root_ang_vel_range"]
+    joint_position_ranges = resolve_expr(
+      params["joint_position_ranges"], self._asset.joint_names, (0.0, 0.0)
+    )
+    joint_velocity_ranges = resolve_expr(
+      params["joint_velocity_ranges"], self._asset.joint_names, (0.0, 0.0)
+    )
+    self._joint_position_ranges = torch.tensor(
+      joint_position_ranges, device=env.device, dtype=torch.float32
+    )
+    self._joint_velocity_ranges = torch.tensor(
+      joint_velocity_ranges, device=env.device, dtype=torch.float32
+    )
+    csv_joint_names: tuple[str, ...] = params["csv_joint_names"]
+    if len(csv_joint_names) != 20:
+      raise ValueError("csv_joint_names must contain exactly 20 joint names.")
+    missing_joint_names = set(csv_joint_names) - set(self._asset.joint_names)
+    if missing_joint_names:
+      raise ValueError(f"CSV joints not found in robot: {sorted(missing_joint_names)}")
+    self._csv_joint_ids = torch.tensor(
+      [self._asset.joint_names.index(name) for name in csv_joint_names],
+      device=env.device,
+      dtype=torch.long,
+    )
+    frame_dir = Path(params["frame_dir"])
+    self._getup_frames = self._load_frames(frame_dir, "getup*.csv")
+    self._fall_frames = self._load_frames(frame_dir, "fall*.csv")
 
     self.level = 0
-    self.is_recovery = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    self.succeeded = torch.zeros_like(self.is_recovery)
+    self.pose_stage = 0
+    self._recovery_probability = self._recovery_stage_probabilities[0]
+    self._target_recovery_probability = self._recovery_probability
+    self.starts_fallen = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    self.assist_active = torch.zeros_like(self.starts_fallen)
+    self.fallen_detected = torch.zeros_like(self.starts_fallen)
+    self.succeeded = torch.zeros_like(self.starts_fallen)
     self.elapsed_s = torch.zeros(env.num_envs, device=env.device)
-    self.hold_s = torch.zeros_like(self.elapsed_s)
+    self.fall_confirm_s = torch.zeros_like(self.elapsed_s)
+    self.upright_hold_s = torch.zeros_like(self.elapsed_s)
+    self.sampled_force = torch.zeros_like(self.elapsed_s)
     self.applied_force = torch.zeros_like(self.elapsed_s)
-    self.pose_index = torch.full(
+    self.sample_source = torch.full(
       (env.num_envs,), -1, device=env.device, dtype=torch.long
     )
 
-    num_poses = len(self._poses)
-    self.attempts = torch.zeros(num_poses, device=env.device, dtype=torch.long)
+    if len(self._poses) == 0:
+      raise ValueError("At least one canonical fallen pose is required.")
+    if self._angle_noise_ramp_attempts <= 0:
+      raise ValueError("angle_noise_ramp_attempts must be positive.")
+    if len(self._recovery_stage_probabilities) != 3:
+      raise ValueError("recovery_stage_probabilities must contain three values.")
+    probability_values = (
+      *self._recovery_stage_probabilities,
+      self._post_stage_recovery_probability,
+      self._low_force_recovery_probability,
+      *self._recovery_probability_limits,
+    )
+    if any(not 0.0 <= probability <= 1.0 for probability in probability_values):
+      raise ValueError("Recovery probabilities must be between zero and one.")
+    if self._recovery_probability_limits[0] > self._recovery_probability_limits[1]:
+      raise ValueError("recovery_probability_limits must be ordered.")
+    if not 0.0 < self._recovery_probability_smoothing <= 1.0:
+      raise ValueError("recovery_probability_smoothing must be in (0, 1].")
+    if self._recovery_probability_feedback_gain < 0.0:
+      raise ValueError("recovery_probability_feedback_gain cannot be negative.")
+    if self._recovery_probability_min_attempts <= 0:
+      raise ValueError("recovery_probability_min_attempts must be positive.")
+    if self._stage_three_weights.shape != (3,):
+      raise ValueError("stage_three_weights must contain getup, fall, canonical.")
+    if bool((self._stage_three_weights < 0.0).any()):
+      raise ValueError("stage_three_weights cannot contain negative values.")
+    if not torch.isclose(
+      self._stage_three_weights.sum(),
+      torch.tensor(1.0, device=env.device),
+    ):
+      raise ValueError("stage_three_weights must sum to one.")
+    self.attempts = torch.zeros((), device=env.device, dtype=torch.long)
     self.successes = torch.zeros_like(self.attempts)
+    self.source_samples = torch.zeros(3, device=env.device, dtype=torch.long)
+
+  def _load_frames(self, frame_dir: Path, pattern: str) -> torch.Tensor:
+    """Load and validate root pose plus joint position CSV frames once."""
+    rows: list[list[float]] = []
+    paths = sorted(frame_dir.glob(pattern))
+    if not paths:
+      raise ValueError(f"No recovery frames match {frame_dir / pattern}.")
+    for path in paths:
+      with path.open(newline="", encoding="utf-8") as csv_file:
+        for line_number, row in enumerate(csv.reader(csv_file), start=1):
+          if len(row) != 27:
+            raise ValueError(
+              f"{path}:{line_number} has {len(row)} columns; expected 27."
+            )
+          rows.append([float(value) for value in row])
+    return torch.tensor(rows, device=self._env.device, dtype=torch.float32)
 
   @property
   def target_force(self) -> float:
-    return float(self._force_levels[self.level].item())
+    """Return the midpoint of the active force range for display purposes."""
+    return float(self._force_ranges[self.level].mean().item())
+
+  @property
+  def force_range(self) -> tuple[float, float]:
+    force_range = self._force_ranges[self.level]
+    return float(force_range[0].item()), float(force_range[1].item())
 
   @property
   def recovery_timeout_s(self) -> float:
@@ -84,19 +203,9 @@ class RlBoyRecoveryAssist:
         self._env.num_envs, device=self._env.device, dtype=torch.long
       )
 
-    recovery_ids = env_ids[self.is_recovery[env_ids]]
+    recovery_ids = env_ids[self.starts_fallen[env_ids]]
     if len(recovery_ids) > 0:
-      pose_indices = self.pose_index[recovery_ids]
-      root_pos = torch.tensor(
-        [pose["pos"] for pose in self._poses],
-        device=self._env.device,
-        dtype=torch.float32,
-      )[pose_indices]
-      root_quat = torch.tensor(
-        [pose["quat"] for pose in self._poses],
-        device=self._env.device,
-        dtype=torch.float32,
-      )[pose_indices]
+      root_pos, root_quat, csv_joint_pos = self._sample_initial_states(recovery_ids)
       root_pos += self._env.scene.env_origins[recovery_ids]
 
       yaw = torch.rand(len(recovery_ids), device=self._env.device) * 2.0 * math.pi
@@ -116,107 +225,264 @@ class RlBoyRecoveryAssist:
       )
       root_state[:, :3] = root_pos
       root_state[:, 3:7] = root_quat
+      root_state[:, 7:10].uniform_(*self._root_lin_vel_range)
+      root_state[:, 10:13].uniform_(*self._root_ang_vel_range)
       self._asset.write_root_state_to_sim(root_state, env_ids=recovery_ids)
-      self.applied_force[recovery_ids] = self.target_force
 
-    self._zero_recovery_commands()
+      default_joint_pos = self._asset.data.default_joint_pos
+      default_joint_vel = self._asset.data.default_joint_vel
+      soft_joint_pos_limits = self._asset.data.soft_joint_pos_limits
+      assert default_joint_pos is not None
+      assert default_joint_vel is not None
+      assert soft_joint_pos_limits is not None
+      joint_pos = default_joint_pos[recovery_ids].clone()
+      csv_mask = self.sample_source[recovery_ids] != 2
+      if bool(csv_mask.any()):
+        csv_rows = csv_mask.nonzero(as_tuple=False).squeeze(-1)
+        joint_pos[csv_rows[:, None], self._csv_joint_ids[None, :]] = csv_joint_pos[
+          csv_rows
+        ]
+      joint_vel = default_joint_vel[recovery_ids].clone()
+      position_noise = self._sample_joint_position_noise(joint_pos)
+      velocity_noise = torch.rand_like(joint_vel)
+      velocity_noise = self._joint_velocity_ranges[:, 0] + velocity_noise * (
+        self._joint_velocity_ranges[:, 1] - self._joint_velocity_ranges[:, 0]
+      )
+      joint_pos += position_noise
+      limits = soft_joint_pos_limits[recovery_ids]
+      joint_pos.clamp_(limits[..., 0], limits[..., 1])
+      joint_vel += velocity_noise
+      self._asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=recovery_ids)
+      force_min, force_max = self.force_range
+      self.sampled_force[recovery_ids] = (
+        torch.rand(len(recovery_ids), device=self._env.device) * (force_max - force_min)
+        + force_min
+      )
+
     self._write_force(env_ids)
+
+  def _sample_initial_states(
+    self, recovery_ids: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample curriculum-dependent root and joint states."""
+    count = len(recovery_ids)
+    sources = self.sample_source[recovery_ids]
+    root_pos = torch.zeros(count, 3, device=self._env.device)
+    root_quat = torch.zeros(count, 4, device=self._env.device)
+    csv_joint_pos = torch.zeros(count, 20, device=self._env.device)
+
+    for source, frames in ((0, self._getup_frames), (1, self._fall_frames)):
+      mask = sources == source
+      sample_count = int(mask.sum().item())
+      if sample_count == 0:
+        continue
+      frame_ids = torch.randint(len(frames), (sample_count,), device=self._env.device)
+      sampled = frames[frame_ids]
+      root_pos[mask, 2] = sampled[:, 2]
+      # CSV stores (qx, qy, qz, qw); simulation expects (qw, qx, qy, qz).
+      quat_xyzw = sampled[:, 3:7]
+      root_quat[mask] = quat_xyzw[:, (3, 0, 1, 2)]
+      csv_joint_pos[mask] = sampled[:, 7:27]
+
+    canonical_mask = sources == 2
+    canonical_count = int(canonical_mask.sum().item())
+    if canonical_count > 0:
+      pose_ids = torch.randint(
+        len(self._poses), (canonical_count,), device=self._env.device
+      )
+      canonical_pos = torch.tensor(
+        [pose["pos"] for pose in self._poses],
+        device=self._env.device,
+        dtype=torch.float32,
+      )
+      canonical_quat = torch.tensor(
+        [pose["quat"] for pose in self._poses],
+        device=self._env.device,
+        dtype=torch.float32,
+      )
+      root_pos[canonical_mask] = canonical_pos[pose_ids]
+      root_pos[canonical_mask, 2].uniform_(*self._root_height_range)
+      root_quat[canonical_mask] = canonical_quat[pose_ids]
+
+    root_quat /= root_quat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return root_pos, root_quat, csv_joint_pos
+
+  def _sample_joint_position_noise(self, joint_pos: torch.Tensor) -> torch.Tensor:
+    """Apply no angle noise in stage one and smoothly enable it in stage two."""
+    if self.pose_stage == 0:
+      return torch.zeros_like(joint_pos)
+    noise = torch.rand_like(joint_pos)
+    noise = self._joint_position_ranges[:, 0] + noise * (
+      self._joint_position_ranges[:, 1] - self._joint_position_ranges[:, 0]
+    )
+    if self.pose_stage == 1:
+      noise *= self._angle_noise_scale()
+    return noise
+
+  def _angle_noise_scale(self) -> float:
+    if self.pose_stage == 0:
+      return 0.0
+    if self.pose_stage == 2:
+      return 1.0
+    success_rate = float((self.successes.float() / self.attempts.clamp_min(1)).item())
+    performance_scale = min(max((success_rate - 0.5) / 0.4, 0.0), 1.0)
+    evidence_scale = min(
+      float(self.attempts.item()) / self._angle_noise_ramp_attempts, 1.0
+    )
+    return performance_scale * evidence_scale
 
   def prepare_group(self, env_ids: torch.Tensor) -> None:
     """Choose episode groups before reset-mode randomization terms run."""
     recovery_mask = (
-      torch.rand(len(env_ids), device=self._env.device)
-      < self._recovery_probability
+      torch.rand(len(env_ids), device=self._env.device) < self._recovery_probability
     )
     recovery_ids = env_ids[recovery_mask]
 
-    self.is_recovery[env_ids] = False
-    self.is_recovery[recovery_ids] = True
+    self.starts_fallen[env_ids] = False
+    self.starts_fallen[recovery_ids] = True
+    self.assist_active[env_ids] = False
+    self.assist_active[recovery_ids] = True
+    self.fallen_detected[env_ids] = False
+    self.fallen_detected[recovery_ids] = True
     self.succeeded[env_ids] = False
     self.elapsed_s[env_ids] = 0.0
-    self.hold_s[env_ids] = 0.0
+    self.fall_confirm_s[env_ids] = 0.0
+    self.upright_hold_s[env_ids] = 0.0
+    self.sampled_force[env_ids] = 0.0
     self.applied_force[env_ids] = 0.0
-    self.pose_index[env_ids] = -1
+    self.sample_source[env_ids] = -1
     if len(recovery_ids) > 0:
-      self.pose_index[recovery_ids] = torch.randint(
-        len(self._poses), (len(recovery_ids),), device=self._env.device
-      )
+      if self.pose_stage < 2:
+        self.sample_source[recovery_ids] = 0
+      else:
+        self.sample_source[recovery_ids] = torch.multinomial(
+          self._stage_three_weights, len(recovery_ids), replacement=True
+        )
+      self.source_samples += torch.bincount(
+        self.sample_source[recovery_ids], minlength=3
+      ).to(self.source_samples)
 
   def __call__(
     self,
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
-    command_name: str,
     poses: list[dict[str, tuple[float, ...]]],
-    recovery_probability: float,
-    force_levels: tuple[float, ...],
+    recovery_stage_probabilities: tuple[float, float, float],
+    post_stage_recovery_probability: float,
+    low_force_recovery_probability: float,
+    recovery_probability_limits: tuple[float, float],
+    recovery_probability_feedback_gain: float,
+    recovery_probability_smoothing: float,
+    recovery_probability_min_attempts: int,
+    angle_noise_ramp_attempts: int,
+    frame_dir: str,
+    csv_joint_names: tuple[str, ...],
+    stage_three_weights: tuple[float, float, float],
+    force_ranges: tuple[tuple[float, float], ...],
     upright_height: float,
     upright_angle: float,
-    ramp_duration_s: float,
-    independent_hold_s: float,
+    fall_height: float,
+    fall_angle: float,
+    fall_confirm_s: float,
+    upright_hold_s: float,
+    force_ramp_up_s: float,
+    force_ramp_down_s: float,
     recovery_timeout_s: float,
+    root_height_range: tuple[float, float],
+    root_lin_vel_range: tuple[float, float],
+    root_ang_vel_range: tuple[float, float],
+    joint_position_ranges: dict[str, tuple[float, float]],
+    joint_velocity_ranges: dict[str, tuple[float, float]],
   ) -> None:
     dt = env.step_dt
     del (
       env_ids,
       asset_cfg,
-      command_name,
       poses,
-      recovery_probability,
-      force_levels,
+      recovery_stage_probabilities,
+      post_stage_recovery_probability,
+      low_force_recovery_probability,
+      recovery_probability_limits,
+      recovery_probability_feedback_gain,
+      recovery_probability_smoothing,
+      recovery_probability_min_attempts,
+      angle_noise_ramp_attempts,
+      frame_dir,
+      csv_joint_names,
+      stage_three_weights,
+      force_ranges,
       upright_height,
       upright_angle,
-      ramp_duration_s,
-      independent_hold_s,
+      fall_height,
+      fall_angle,
+      fall_confirm_s,
+      upright_hold_s,
+      force_ramp_up_s,
+      force_ramp_down_s,
       recovery_timeout_s,
+      root_height_range,
+      root_lin_vel_range,
+      root_ang_vel_range,
+      joint_position_ranges,
+      joint_velocity_ranges,
     )
-    active = self.is_recovery & ~self.succeeded
-    self.elapsed_s[active] += dt
 
     height = self._asset.data.root_link_pos_w[:, 2]
-    gravity_z = self._asset.data.projected_gravity_b[:, 2].clamp(-1.0, 1.0)
-    angle = torch.acos(-gravity_z).abs()
-    upright = (height >= self._upright_height) & (angle <= self._upright_angle)
+    gravity_z = -self._asset.data.projected_gravity_b[:, 2].clamp(-1.0, 1.0)
+    tilt = torch.acos(gravity_z)
 
-    ramp_rate = self.target_force / max(self._ramp_duration_s, dt)
-    ramp_down = active & upright
-    ramp_up = active & ~upright
-    self.applied_force[ramp_down] = torch.clamp(
-      self.applied_force[ramp_down] - ramp_rate * dt, min=0.0
+    fallen = (height < self._fall_height) | (tilt > self._fall_angle)
+    self.fallen_detected.copy_(fallen)
+    confirming = fallen & ~self.assist_active
+    self.fall_confirm_s = torch.where(
+      confirming, self.fall_confirm_s + dt, torch.zeros_like(self.fall_confirm_s)
     )
-    self.applied_force[ramp_up] = torch.clamp(
-      self.applied_force[ramp_up] + ramp_rate * dt, max=self.target_force
+    newly_active = confirming & (self.fall_confirm_s >= self._fall_confirm_s)
+    force_min, force_max = self.force_range
+    sampled_force = (
+      torch.rand(env.num_envs, device=env.device) * (force_max - force_min) + force_min
     )
+    self.sampled_force[newly_active] = sampled_force[newly_active]
+    self.assist_active[newly_active] = True
+    self.succeeded[newly_active] = False
+    self.elapsed_s[newly_active] = 0.0
+    self.upright_hold_s[newly_active] = 0.0
 
-    independent = active & upright & (self.applied_force <= 1e-4)
-    self.hold_s[independent] += dt
-    self.hold_s[active & ~independent] = 0.0
-    newly_succeeded = active & (self.hold_s >= self._independent_hold_s)
+    active = self.assist_active & ~self.succeeded
+    self.elapsed_s[active] += dt
+    upright = (height >= self._upright_height) & (tilt <= self._upright_angle)
+
+    desired_force = torch.where(
+      active & ~upright, self.sampled_force, torch.zeros_like(self.sampled_force)
+    )
+    ramp_reference = self.sampled_force.clamp_min(1.0)
+    ramp_up_step = ramp_reference * dt / max(self._force_ramp_up_s, dt)
+    ramp_down_step = ramp_reference * dt / max(self._force_ramp_down_s, dt)
+    force_error = desired_force - self.applied_force
+    force_step = torch.where(
+      force_error >= 0.0,
+      torch.minimum(force_error, ramp_up_step),
+      torch.maximum(force_error, -ramp_down_step),
+    )
+    self.applied_force += force_step
+
+    independently_upright = active & upright & (self.applied_force <= 1e-3)
+    self.upright_hold_s = torch.where(
+      independently_upright,
+      self.upright_hold_s + dt,
+      torch.zeros_like(self.upright_hold_s),
+    )
+    newly_succeeded = (
+      active
+      & (self.upright_hold_s >= self._upright_hold_s)
+      & (self.applied_force <= 1e-3)
+    )
     self.succeeded[newly_succeeded] = True
+    self.assist_active[newly_succeeded] = False
     self.applied_force[newly_succeeded] = 0.0
 
-    self._zero_recovery_commands()
     self._write_force()
-
-  def _zero_recovery_commands(self) -> None:
-    command = self._env.command_manager.get_command(self._command_name)
-    assert isinstance(command, torch.Tensor)
-    command[self.is_recovery] = 0.0
-    term = self._env.command_manager.get_term(self._command_name)
-    for attr in ("vel_command_w", "heading_target"):
-      value = getattr(term, attr, None)
-      if value is not None:
-        value[self.is_recovery] = 0.0
-    for attr in (
-      "is_heading_env",
-      "is_world_env",
-      "is_forward_env",
-      "is_standing_env",
-    ):
-      value = getattr(term, attr, None)
-      if value is not None:
-        value[self.is_recovery] = False
 
   def _write_force(self, env_ids: torch.Tensor | None = None) -> None:
     if env_ids is None:
@@ -233,54 +499,89 @@ class RlBoyRecoveryAssist:
     )
 
   def record_outcomes(self, env_ids: torch.Tensor) -> None:
-    """Accumulate completed recovery attempts by initial fallen direction."""
-    recovery_ids = env_ids[self.is_recovery[env_ids]]
+    """Accumulate completed controlled recovery attempts globally."""
+    recovery_ids = env_ids[self.starts_fallen[env_ids]]
     if len(recovery_ids) == 0:
       return
-    pose_indices = self.pose_index[recovery_ids]
-    self.attempts += torch.bincount(pose_indices, minlength=len(self._poses)).to(
-      self.attempts
-    )
-    successful_poses = pose_indices[self.succeeded[recovery_ids]]
-    self.successes += torch.bincount(successful_poses, minlength=len(self._poses)).to(
-      self.successes
-    )
+    self.attempts += len(recovery_ids)
+    self.successes += self.succeeded[recovery_ids].sum()
 
   def update_level(
     self,
     window_size: int,
     success_threshold: float,
-    direction_threshold: float,
-    min_direction_attempts: int,
-    failure_threshold: float,
   ) -> None:
-    attempts = int(self.attempts.sum().item())
+    attempts = int(self.attempts.item())
     if attempts < window_size:
       return
-    overall_rate = float(self.successes.sum().item()) / max(attempts, 1)
-    direction_ready = bool((self.attempts >= min_direction_attempts).all())
-    direction_rates = self.successes.float() / self.attempts.clamp_min(1)
-
-    if (
-      self.level < len(self._force_levels) - 1
-      and overall_rate >= success_threshold
-      and direction_ready
-      and bool((direction_rates >= direction_threshold).all())
-    ):
+    if int(self.successes.item()) < success_threshold * attempts:
+      return
+    if self.pose_stage < 2:
+      self.pose_stage += 1
+    elif self.level < len(self._force_ranges) - 1:
       self.level += 1
-    elif self.level > 0 and overall_rate < failure_threshold:
-      self.level -= 1
     self.attempts.zero_()
     self.successes.zero_()
 
+  def update_recovery_probability(self, success_target: float) -> None:
+    """Smoothly adapt the next-reset recovery population around its stage base."""
+    base_probability = self._base_recovery_probability()
+    target_probability = base_probability
+    attempts = int(self.attempts.item())
+    if attempts >= self._recovery_probability_min_attempts:
+      success_rate = float((self.successes.float() / self.attempts).item())
+      feedback = self._recovery_probability_feedback_gain * (
+        success_target - success_rate
+      )
+      target_probability += min(max(feedback, -0.1), 0.1)
+    target_probability = min(
+      max(target_probability, self._recovery_probability_limits[0]),
+      self._recovery_probability_limits[1],
+    )
+    self._target_recovery_probability = target_probability
+    alpha = self._recovery_probability_smoothing
+    self._recovery_probability = (
+      1.0 - alpha
+    ) * self._recovery_probability + alpha * target_probability
+
+  def _base_recovery_probability(self) -> float:
+    if self.pose_stage < 2:
+      return self._recovery_stage_probabilities[self.pose_stage]
+    if self.level == 0:
+      return self._recovery_stage_probabilities[2]
+    if self.level >= len(self._force_ranges) - 2:
+      return self._low_force_recovery_probability
+    return self._post_stage_recovery_probability
+
   def curriculum_state(self) -> dict[str, torch.Tensor]:
-    attempts = self.attempts.sum()
+    attempts = self.attempts
     rate = self.successes.sum().float() / attempts.clamp_min(1)
+    force_range = self._force_ranges[self.level]
+    recovery_count = self.assist_active.sum().clamp_min(1)
+    actual_mean = (
+      self.applied_force * self.assist_active.float()
+    ).sum() / recovery_count
     return {
       "level": torch.tensor(self.level, device=self._env.device),
-      "force_n": self._force_levels[self.level],
+      "pose_stage": torch.tensor(self.pose_stage, device=self._env.device),
+      "force_n": force_range.mean(),
+      "force_min_n": force_range[0],
+      "force_max_n": force_range[1],
+      "actual_force_mean_n": actual_mean,
       "attempts": attempts,
       "success_rate": rate,
+      "recovery_probability": torch.tensor(
+        self._recovery_probability, device=self._env.device
+      ),
+      "target_recovery_probability": torch.tensor(
+        self._target_recovery_probability, device=self._env.device
+      ),
+      "angle_noise_scale": torch.tensor(
+        self._angle_noise_scale(), device=self._env.device
+      ),
+      "getup_samples": self.source_samples[0],
+      "fall_samples": self.source_samples[1],
+      "canonical_samples": self.source_samples[2],
     }
 
 
@@ -297,22 +598,14 @@ def recovery_assist_curriculum(
   event_name: str,
   window_size: int,
   success_threshold: float,
-  direction_threshold: float,
-  min_direction_attempts: int,
-  failure_threshold: float,
 ) -> dict[str, torch.Tensor]:
   """Update assistance using outcomes from fallen-recovery environments only."""
   if isinstance(env_ids, slice):
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
   assist = _get_assist(env, event_name)
   assist.record_outcomes(env_ids)
-  assist.update_level(
-    window_size,
-    success_threshold,
-    direction_threshold,
-    min_direction_attempts,
-    failure_threshold,
-  )
+  assist.update_recovery_probability(success_threshold)
+  assist.update_level(window_size, success_threshold)
   return assist.curriculum_state()
 
 
@@ -350,8 +643,8 @@ def normal_group_payload(
   if isinstance(env_ids, slice):
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
   assist = _get_assist(env, event_name)
-  recovery_ids = env_ids[assist.is_recovery[env_ids]]
-  normal_ids = env_ids[~assist.is_recovery[env_ids]]
+  recovery_ids = env_ids[assist.starts_fallen[env_ids]]
+  normal_ids = env_ids[~assist.starts_fallen[env_ids]]
   stage = _active_stage(env.common_step_counter, stages)
 
   if len(recovery_ids) > 0:
@@ -381,7 +674,11 @@ def push_normal_group(
 ) -> None:
   """Apply the active push stage to normal environments only."""
   assist = _get_assist(env, event_name)
-  normal_ids = env_ids[~assist.is_recovery[env_ids]]
+  normal_ids = env_ids[
+    ~assist.starts_fallen[env_ids]
+    & ~assist.fallen_detected[env_ids]
+    & ~assist.assist_active[env_ids]
+  ]
   if len(normal_ids) == 0:
     return
   velocity_range = _active_stage(env.common_step_counter, stages)["velocity_range"]
@@ -408,9 +705,9 @@ def normal_randomization_curriculum(
     if env.common_step_counter >= candidate["step"]:
       stage_index = index
   stage = stages[stage_index]
-  env.event_manager.get_term_cfg(
-    push_event_name
-  ).interval_range_s = stage["push_interval_s"]
+  env.event_manager.get_term_cfg(push_event_name).interval_range_s = stage[
+    "push_interval_s"
+  ]
   max_push = max(
     (max(abs(low), abs(high)) for low, high in stage["velocity_range"].values()),
     default=0.0,
@@ -434,16 +731,16 @@ def recovery_bad_orientation(
   asset: Entity = env.scene[asset_cfg.name]
   angle = torch.acos(-asset.data.projected_gravity_b[:, 2].clamp(-1.0, 1.0)).abs()
   fell = angle > limit_angle
-  return fell & ~_get_assist(env, event_name).is_recovery
+  return fell & ~_get_assist(env, event_name).assist_active
 
 
 def recovery_succeeded(
   env: ManagerBasedRlEnv,
   event_name: str,
 ) -> torch.Tensor:
-  """End a recovery episode after unassisted stable standing."""
+  """End a recovery episode once the configured root height is reached."""
   return (
-    _get_assist(env, event_name).is_recovery & _get_assist(env, event_name).succeeded
+    _get_assist(env, event_name).starts_fallen & _get_assist(env, event_name).succeeded
   )
 
 
@@ -454,12 +751,20 @@ def recovery_timed_out(
   """Terminate recovery episodes that do not stand before their deadline."""
   assist = _get_assist(env, event_name)
   return (
-    assist.is_recovery
+    assist.assist_active
     & ~assist.succeeded
     & (assist.elapsed_s >= assist.recovery_timeout_s)
   )
 
 
+def recovery_failure_penalty(
+  env: ManagerBasedRlEnv,
+  event_name: str,
+) -> torch.Tensor:
+  """Return a one-shot failure cost corrected for reward-rate dt scaling."""
+  return recovery_timed_out(env, event_name).float() / env.step_dt
+
+
 def recovery_mask(env: ManagerBasedRlEnv, event_name: str) -> torch.Tensor:
-  """Return the recovery-group mask for reward terms."""
-  return _get_assist(env, event_name).is_recovery
+  """Return the dynamic assistance mask."""
+  return _get_assist(env, event_name).assist_active

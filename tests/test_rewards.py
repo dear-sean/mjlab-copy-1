@@ -293,6 +293,22 @@ def test_reward_scaling_enabled(mock_env):
   assert torch.allclose(step_reward, torch.full((4,), expected_step))
 
 
+def test_reward_logging_can_be_disabled_without_disabling_reward(mock_env):
+  def constant_reward(env):
+    return torch.ones(env.num_envs, device=env.device)
+
+  cfg = {
+    "visible": RewardTermCfg(func=constant_reward, weight=1.0),
+    "hidden": RewardTermCfg(func=constant_reward, weight=2.0, log=False),
+  }
+  manager = RewardManager(cfg, mock_env, scale_by_dt=False)
+
+  assert torch.allclose(manager.compute(dt=0.02), torch.full((4,), 3.0))
+  logs = manager.reset()
+  assert "Episode_Reward/visible" in logs
+  assert "Episode_Reward/hidden" not in logs
+
+
 def test_reward_scaling_disabled(mock_env):
   """Test that rewards are not scaled by dt when scale_by_dt=False."""
 

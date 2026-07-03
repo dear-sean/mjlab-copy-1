@@ -2,12 +2,19 @@
 
 import torch
 
-from mjlab.tasks.velocity.config.rlboy.env_cfgs import rlboy_flat_env_cfg
+from mjlab.tasks.velocity.config.rlboy.env_cfgs import (
+  _smoothstep,
+  gated_track_angular_velocity,
+  gated_track_linear_velocity,
+  gated_upright,
+  gated_variable_posture,
+  recovery_progress_reward,
+  rlboy_flat_env_cfg,
+)
 from mjlab.tasks.velocity.config.rlboy.recovery_assist import (
   RECOVERY_ASSIST_EVENT_NAME,
   RlBoyRecoveryAssist,
   recovery_assist_curriculum,
-  recovery_bad_orientation,
 )
 from mjlab.tasks.velocity.config.rlboy.rl_cfg import rlboy_ppo_runner_cfg
 
@@ -19,46 +26,227 @@ def test_flat_rlboy_enables_recovery_assist_only_during_training() -> None:
   assist_cfg = train_cfg.events[RECOVERY_ASSIST_EVENT_NAME]
   assert assist_cfg.func is RlBoyRecoveryAssist
   assert assist_cfg.mode == "step"
-  assert assist_cfg.params["asset_cfg"].body_names == ("head_yaw_link",)
-  assert assist_cfg.params["force_levels"][-1] == 0.0
+  assert assist_cfg.params["asset_cfg"].body_names == ("waist_yaw_link",)
+  assert assist_cfg.params["force_ranges"] == (
+    (50.0, 50.0),
+    (40.0, 45.0),
+    (32.0, 38.0),
+    (25.0, 30.0),
+    (20.0, 24.0),
+    (12.0, 19.0),
+    (6.0, 11.0),
+    (0.0, 5.0),
+    (0.0, 0.0),
+  )
+  assert assist_cfg.params["upright_height"] == 0.38
+  assert assist_cfg.params["stage_three_weights"] == (0.3, 0.4, 0.3)
+  assert assist_cfg.params["angle_noise_ramp_attempts"] == 300
+  assert assist_cfg.params["recovery_stage_probabilities"] == (0.6, 0.5, 0.4)
+  assert assist_cfg.params["post_stage_recovery_probability"] == 0.35
+  assert assist_cfg.params["low_force_recovery_probability"] == 0.3
+  assert assist_cfg.params["recovery_probability_limits"] == (0.25, 0.65)
+  assert assist_cfg.params["recovery_probability_min_attempts"] == 50
+  assert assist_cfg.params["frame_dir"].endswith("motions/getup_frame_data")
+  assert len(assist_cfg.params["csv_joint_names"]) == 20
+  assert assist_cfg.params["upright_angle"] == torch.deg2rad(torch.tensor(15.0))
+  assert assist_cfg.params["fall_height"] == 0.24
+  assert assist_cfg.params["fall_angle"] == torch.deg2rad(torch.tensor(60.0))
+  assert assist_cfg.params["fall_confirm_s"] == 0.12
+  assert assist_cfg.params["upright_hold_s"] == 0.5
+  assert assist_cfg.params["force_ramp_up_s"] == 0.3
+  assert assist_cfg.params["force_ramp_down_s"] == 0.5
+  assert assist_cfg.params["root_height_range"] == (0.1, 0.13)
+  assert assist_cfg.params["root_lin_vel_range"] == (-0.1, 0.1)
+  assert assist_cfg.params["root_ang_vel_range"] == (-0.2, 0.2)
+  assert assist_cfg.params["joint_position_ranges"]["head_yaw_joint"] == (0.0, 0.0)
+  assert assist_cfg.params["joint_velocity_ranges"][r".*(shoulder|elbow).*"] == (
+    -0.4,
+    0.4,
+  )
+  assert "command_name" not in assist_cfg.params
   assert train_cfg.curriculum["recovery_assist"].func is recovery_assist_curriculum
-  assert train_cfg.terminations["fell_over"].func is recovery_bad_orientation
+  assert train_cfg.curriculum["recovery_assist"].params["window_size"] == 300
+  assert train_cfg.curriculum["recovery_assist"].params["success_threshold"] == 0.9
+  assert not train_cfg.curriculum["command_vel"].log
+  assert "mean_action_acc" not in train_cfg.metrics
+  for reward_name in (
+    "air_time",
+    "foot_clearance",
+    "foot_swing_height",
+    "foot_slip",
+    "soft_landing",
+    "self_collisions",
+  ):
+    assert not train_cfg.rewards[reward_name].log
+  assert "fell_over" not in train_cfg.terminations
+  assert train_cfg.rewards["track_linear_velocity"].func is gated_track_linear_velocity
+  assert (
+    train_cfg.rewards["track_angular_velocity"].func is gated_track_angular_velocity
+  )
+  assert train_cfg.rewards["recovery_progress"].func is recovery_progress_reward
+  assert train_cfg.rewards["upright"].func is gated_upright
+  assert train_cfg.rewards["upright"].params["gate_min_scale"] == 0.5
+  assert train_cfg.rewards["pose"].func is gated_variable_posture
+  assert train_cfg.rewards["pose"].params["gate_min_scale"] == 0.1
+  assert train_cfg.rewards["action_rate_l2"].params["gate_min_scale"] == 0.3
+  assert train_cfg.rewards["air_time"].params["gate_min_scale"] == 0.0
+  assert train_cfg.rewards["foot_slip"].params["gate_min_scale"] == 0.1
+  assert (
+    train_cfg.rewards["base_height_recovery_success"].params["gate_height_low"] == 0.24
+  )
+  assert (
+    "recovery_event_name"
+    not in train_cfg.rewards["base_height_recovery_success"].params
+  )
+  assert "recovery_event_name" not in train_cfg.rewards["recovery_progress"].params
+  assert train_cfg.rewards["recovery_failure"].weight == -2.0
+  assert train_cfg.rewards["recovery_failure"].params == {
+    "event_name": RECOVERY_ASSIST_EVENT_NAME
+  }
 
   assert "randomize_fallen_pose" not in train_cfg.events
   assert next(iter(train_cfg.events)) == "prepare_recovery_group"
   assert "push_robot" in train_cfg.events
+  assert "knockdown_robot" in train_cfg.events
+  knockdown_cfg = train_cfg.events["knockdown_robot"]
+  assert knockdown_cfg.interval_range_s == (13.0, 15.0)
+  assert knockdown_cfg.params["stages"][0]["velocity_range"] == {
+    "x": (-1.5, 1.5),
+    "y": (-1.5, 1.5),
+    "roll": (-2.5, 2.5),
+    "pitch": (-2.5, 2.5),
+    "yaw": (-1.0, 1.0),
+  }
   assert "base_payload" in train_cfg.events
   assert RECOVERY_ASSIST_EVENT_NAME not in play_cfg.events
   assert "recovery_assist" not in play_cfg.curriculum
+  assert "fell_over" not in play_cfg.terminations
+  assert set(play_cfg.terminations) == {"time_out"}
 
 
-def test_recovery_level_requires_each_fallen_direction() -> None:
+def test_recovery_gate_smoothstep_is_bounded_and_smooth() -> None:
+  values = torch.tensor((0.1, 0.24, 0.31, 0.38, 0.5))
+  result = _smoothstep(values, 0.24, 0.38)
+
+  assert torch.equal(result[[0, 1]], torch.zeros(2))
+  assert torch.equal(result[[-2, -1]], torch.ones(2))
+  assert torch.isclose(result[2], torch.tensor(0.5))
+
+
+def test_recovery_pose_stages_advance_before_assistance_level() -> None:
   assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
   assist.level = 0
-  assist._force_levels = torch.tensor((50.0, 40.0, 30.0))
-  assist.attempts = torch.tensor((50, 50, 50, 50))
-  assist.successes = torch.tensor((45, 45, 45, 45))
+  assist.pose_stage = 0
+  assist._force_ranges = torch.tensor(((50.0, 50.0), (40.0, 45.0), (32.0, 38.0)))
+  assist.attempts = torch.tensor(300)
+  assist.successes = torch.tensor(270)
 
-  assist.update_level(
-    window_size=200,
-    success_threshold=0.8,
-    direction_threshold=0.7,
-    min_direction_attempts=30,
-    failure_threshold=0.4,
-  )
-  assert assist.level == 1
-  assert assist.attempts.sum() == 0
+  assist.update_level(window_size=300, success_threshold=0.9)
+  assert assist.pose_stage == 1
+  assert assist.level == 0
+  assert assist.attempts == 0
 
-  assist.attempts = torch.tensor((80, 80, 35, 5))
-  assist.successes = torch.tensor((75, 75, 34, 5))
-  assist.update_level(
-    window_size=200,
-    success_threshold=0.8,
-    direction_threshold=0.7,
-    min_direction_attempts=30,
-    failure_threshold=0.4,
-  )
+  assist.attempts = torch.tensor(300)
+  assist.successes = torch.tensor(269)
+  assist.update_level(window_size=300, success_threshold=0.9)
+  assert assist.pose_stage == 1
+  assert assist.attempts == 300
+
+  assist.successes = torch.tensor(270)
+  assist.update_level(window_size=300, success_threshold=0.9)
+  assert assist.pose_stage == 2
+  assist.attempts = torch.tensor(300)
+  assist.successes = torch.tensor(285)
+  assist.update_level(window_size=300, success_threshold=0.9)
   assert assist.level == 1
+
+
+def test_recovery_angle_noise_is_disabled_then_smoothly_enabled() -> None:
+  assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
+  assist._joint_position_ranges = torch.tensor(((-1.0, 1.0), (2.0, 2.0)))
+  joint_pos = torch.zeros(4, 2)
+
+  assist.pose_stage = 0
+  assert torch.equal(
+    assist._sample_joint_position_noise(joint_pos), torch.zeros_like(joint_pos)
+  )
+
+  assist.pose_stage = 1
+  assist._angle_noise_ramp_attempts = 300
+  assist.attempts = torch.tensor(300)
+  assist.successes = torch.tensor(210)
+  stage_two_noise = assist._sample_joint_position_noise(joint_pos)
+  assert torch.allclose(stage_two_noise[:, 1], torch.ones(4))
+
+  assist.pose_stage = 2
+  stage_three_noise = assist._sample_joint_position_noise(joint_pos)
+  assert torch.allclose(stage_three_noise[:, 1], torch.full((4,), 2.0))
+
+
+def test_recovery_csv_quaternion_is_reordered_and_normalized() -> None:
+  assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
+  assist._env = type("Env", (), {"device": "cpu"})()
+  assist.sample_source = torch.tensor((0,))
+  assist._getup_frames = torch.tensor(
+    [[0.0, 0.0, 0.2, 1.0, 2.0, 3.0, 4.0, *([0.0] * 20)]]
+  )
+  assist._fall_frames = assist._getup_frames
+  assist._poses = [{"pos": (0.0, 0.0, 0.1), "quat": (1.0, 0.0, 0.0, 0.0)}]
+  assist._root_height_range = (0.1, 0.13)
+
+  root_pos, root_quat, _ = assist._sample_initial_states(torch.tensor((0,)))
+
+  assert torch.equal(root_pos, torch.tensor(((0.0, 0.0, 0.2),)))
+  expected = torch.tensor(((4.0, 1.0, 2.0, 3.0),))
+  expected /= expected.norm(dim=-1, keepdim=True)
+  assert torch.allclose(root_quat, expected)
+
+
+def test_recovery_group_probability_tracks_stage_and_success() -> None:
+  assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
+  assist._recovery_stage_probabilities = (0.6, 0.5, 0.4)
+  assist._post_stage_recovery_probability = 0.35
+  assist._low_force_recovery_probability = 0.3
+  assist._recovery_probability_limits = (0.25, 0.65)
+  assist._recovery_probability_feedback_gain = 0.5
+  assist._recovery_probability_smoothing = 0.1
+  assist._recovery_probability_min_attempts = 50
+  assist._force_ranges = torch.zeros(9, 2)
+  assist.pose_stage = 0
+  assist.level = 0
+  assist._recovery_probability = 0.6
+  assist._target_recovery_probability = 0.6
+  assist.attempts = torch.tensor(0)
+  assist.successes = torch.tensor(0)
+
+  assist.update_recovery_probability(success_target=0.9)
+  assert assist._target_recovery_probability == 0.6
+
+  assist.pose_stage = 1
+  assist.attempts = torch.tensor(100)
+  assist.successes = torch.tensor(60)
+  assist.update_recovery_probability(success_target=0.9)
+  assert torch.isclose(
+    torch.tensor(assist._target_recovery_probability), torch.tensor(0.6)
+  )
+  assert torch.isclose(torch.tensor(assist._recovery_probability), torch.tensor(0.6))
+
+  assist.pose_stage = 2
+  assist.level = 1
+  assist.attempts = torch.tensor(100)
+  assist.successes = torch.tensor(100)
+  assist.update_recovery_probability(success_target=0.9)
+  assert torch.isclose(
+    torch.tensor(assist._target_recovery_probability), torch.tensor(0.3)
+  )
+  assert torch.isclose(torch.tensor(assist._recovery_probability), torch.tensor(0.57))
+
+  assist.level = 8
+  assist.attempts = torch.tensor(0)
+  assist.update_recovery_probability(success_target=0.9)
+  assert torch.isclose(
+    torch.tensor(assist._target_recovery_probability), torch.tensor(0.3)
+  )
 
 
 def test_rlboy_curricula_fit_four_thousand_iterations() -> None:

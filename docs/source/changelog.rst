@@ -10,11 +10,34 @@ Added
 
 - Added a fallen-recovery assistance curriculum to
   ``Mjlab-Velocity-Flat-RL_BOY``. Dedicated recovery environments receive a
-  staged upward force at the head, and only successful unassisted recovery
-  attempts advance the curriculum. The RL_BOY velocity training schedule now
-  spans 4,000 PPO iterations, with its command stages scaled proportionally.
+  staged upward force at the waist, sampled once per episode from the active
+  force range, and only recovery attempts that reach the target standing height
+  advance the curriculum. The RL_BOY velocity training
+  schedule now spans 4,000 PPO iterations, with its command stages scaled
+  proportionally. Recovery reset poses now follow a success-based three-stage
+  curriculum: clean get-up CSV frames with velocity noise, progressively
+  angle-randomized get-up frames, then a mixture of get-up frames, fallen CSV
+  frames, and canonical fallen poses. Global recovery success replaces
+  direction-specific sampling statistics. The recovery reset population now
+  decreases from 60% toward 30% as the pose and assistance curricula advance,
+  with bounded, smoothed feedback around each stage's baseline success rate.
+  Low-priority foot, contact, command-range, and action-acceleration diagnostics
+  are omitted from the flat RL_BOY training log without changing their rewards
+  or curriculum behavior.
+  Flat RL_BOY play mode no longer resets on ``fell_over``, allowing autonomous
+  recovery behavior to be evaluated after a fall.
   Payload and push randomization are introduced in later stages for normal
   episodes while recovery episodes remain free of both disturbances.
+  All RL_BOY collision bodies now have tangential friction in both velocity and
+  tracking tasks, allowing hands, knees, and the torso to support recovery motions.
+  Recovery assistance is applied at the waist, normal walking episodes receive an
+  additional low-frequency high-magnitude knockdown disturbance, and flat RL_BOY
+  episodes no longer terminate on bad orientation. Assistance now activates after
+  sustained falls in either initial-pose group and ramps on and off around stable
+  recovery instead of changing force instantaneously. Failed recovery attempts
+  terminate after five seconds and receive a single modest failure penalty.
+  Fallen resets also randomize root height and velocity plus per-joint position
+  and velocity within conservative, joint-specific ranges.
 - Added ``--log-root`` CLI option to ``train``, ``play``, and ``evaluate``
   scripts for choosing where training logs are stored. Defaults to
   ``logs/rsl_rl`` (unchanged behavior). Useful for directing outputs to a

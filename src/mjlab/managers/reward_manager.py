@@ -26,6 +26,9 @@ class RewardTermCfg(ManagerTermBaseCfg):
   weight: float
   """Weight multiplier for this reward term."""
 
+  log: bool = True
+  """Whether to include this term in ``Episode_Reward/*`` logs."""
+
 
 class RewardManager(ManagerBase):
   """Manages reward computation by aggregating weighted reward terms.
@@ -103,11 +106,12 @@ class RewardManager(ManagerBase):
     if env_ids is None:
       env_ids = slice(None)
     extras = {}
-    for key in self._episode_sums.keys():
+    for key, term_cfg in zip(self._episode_sums.keys(), self._term_cfgs, strict=True):
       episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-      extras["Episode_Reward/" + key] = (
-        episodic_sum_avg / self._env.max_episode_length_s
-      )
+      if term_cfg.log:
+        extras["Episode_Reward/" + key] = (
+          episodic_sum_avg / self._env.max_episode_length_s
+        )
       self._episode_sums[key][env_ids] = 0.0
     for term_cfg in self._class_term_cfgs:
       term_cfg.func.reset(env_ids=env_ids)

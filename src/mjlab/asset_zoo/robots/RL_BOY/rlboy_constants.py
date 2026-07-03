@@ -178,16 +178,19 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
 
 _foot_regex = "^(left|right)_foot[1-7]_collision$"
 
-# This enables all collisions.
-# Foot collisions are given custom condim, friction.
+# Enable frictional contact for every collision geom. Feet retain higher-dimensional
+# contact and stronger sliding friction; the remaining links use standard tangential
+# friction so hands, knees, and the torso can support recovery motions.
 FULL_COLLISION = CollisionCfg(
   geom_names_expr=(".*_collision",),
   # Harden all collision geoms.
   solref=(0.01, 1),
-  # Configure feet colliders. Other colliders are frictionless (condim=1).
-  condim={_foot_regex: 6, ".*_collision": 1},
+  condim={_foot_regex: 6, ".*_collision": 3},
   priority={_foot_regex: 1},
-  friction={_foot_regex: (1, 5e-3, 5e-4)},
+  friction={
+    _foot_regex: (1.0, 5e-3, 5e-4),
+    ".*_collision": (0.6, 5e-3, 5e-4),
+  },
 )
 
 ##

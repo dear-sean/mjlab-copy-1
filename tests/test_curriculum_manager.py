@@ -39,3 +39,25 @@ def test_get_active_iterable_terms_handles_dict_and_scalar_state(mock_env):
   terms = dict(manager.get_active_iterable_terms(0))
   assert terms["dict_term"] == [1.5, 2.0]
   assert terms["scalar_term"] == [7.0]
+
+
+def test_curriculum_logging_can_be_disabled_without_disabling_compute(mock_env):
+  calls = []
+
+  def curriculum_func(env, env_ids):
+    calls.append(env_ids)
+    return {"value": torch.tensor(1.0)}
+
+  manager = CurriculumManager(
+    {
+      "visible": CurriculumTermCfg(func=curriculum_func),
+      "hidden": CurriculumTermCfg(func=curriculum_func, log=False),
+    },
+    mock_env,
+  )
+  manager.compute()
+
+  logs = manager.reset()
+  assert len(calls) == 2
+  assert "Curriculum/visible/value" in logs
+  assert "Curriculum/hidden/value" not in logs
