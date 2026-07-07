@@ -11,6 +11,7 @@ import torch
 
 from mjlab.envs import mdp as envs_mdp
 from mjlab.managers.event_manager import RecomputeLevel, requires_model_fields
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.string import resolve_expr
 
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
 
 
 RECOVERY_ASSIST_EVENT_NAME = "recovery_assist"
+
+
+def _selected_names(names: tuple[str, ...], ids: list[int] | slice) -> tuple[str, ...]:
+  if isinstance(ids, slice):
+    return names[ids]
+  return tuple(names[index] for index in ids)
 
 
 def _quat_mul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -36,6 +43,51 @@ def _quat_mul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     ),
     dim=-1,
   )
+
+
+class actuator_torque_limit_excess_penalty:
+  """Penalize actuator torques only after they exceed configured limits."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+    self._asset: Entity = env.scene[self._asset_cfg.name]
+    actuator_names = _selected_names(
+      self._asset.actuator_names, self._asset_cfg.actuator_ids
+    )
+    limits = resolve_expr(cfg.params["limit_by_actuator"], actuator_names)
+    if any(limit is None for limit in limits):
+      missing = [
+        name
+        for name, limit in zip(actuator_names, limits, strict=True)
+        if limit is None
+      ]
+      raise ValueError(f"Missing torque limit for actuator(s): {missing}")
+    self._limits = torch.tensor(limits, device=env.device, dtype=torch.float32)
+    if bool((self._limits <= 0.0).any()):
+      raise ValueError("Torque limits must be positive.")
+    self._threshold_ratio: float = cfg.params.get("threshold_ratio", 1.0)
+    if self._threshold_ratio < 0.0:
+      raise ValueError("threshold_ratio cannot be negative.")
+    self._log_prefix: str | None = cfg.params.get("log_prefix")
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    limit_by_actuator: dict[str, float],
+    threshold_ratio: float = 1.0,
+    log_prefix: str | None = None,
+  ) -> torch.Tensor:
+    del asset_cfg, limit_by_actuator, threshold_ratio, log_prefix
+    torques = self._asset.data.actuator_force[:, self._asset_cfg.actuator_ids]
+    ratio = torch.abs(torques) / self._limits
+    excess = torch.clamp(ratio - self._threshold_ratio, min=0.0)
+    if self._log_prefix is not None:
+      env.extras["log"][f"Metrics/{self._log_prefix}/max_ratio"] = ratio.max()
+      env.extras["log"][f"Metrics/{self._log_prefix}/active_fraction"] = (
+        (excess > 0.0).float().mean()
+      )
+    return torch.sum(torch.square(excess), dim=1)
 
 
 class RlBoyRecoveryAssist:
@@ -514,12 +566,11 @@ class RlBoyRecoveryAssist:
     attempts = int(self.attempts.item())
     if attempts < window_size:
       return
-    if int(self.successes.item()) < success_threshold * attempts:
-      return
-    if self.pose_stage < 2:
-      self.pose_stage += 1
-    elif self.level < len(self._force_ranges) - 1:
-      self.level += 1
+    if int(self.successes.item()) >= success_threshold * attempts:
+      if self.pose_stage < 2:
+        self.pose_stage += 1
+      elif self.level < len(self._force_ranges) - 1:
+        self.level += 1
     self.attempts.zero_()
     self.successes.zero_()
 
@@ -607,6 +658,38 @@ def recovery_assist_curriculum(
   assist.update_recovery_probability(success_threshold)
   assist.update_level(window_size, success_threshold)
   return assist.curriculum_state()
+
+
+def recovery_assist_reward_weight_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | slice,
+  event_name: str,
+  assist_level: int,
+  assist_weights: dict[str, float],
+  complete_weights: dict[str, float],
+) -> dict[str, torch.Tensor]:
+  """Stage reward weights based on recovery assistance progress."""
+  del env_ids
+  assist = _get_assist(env, event_name)
+  force_range = assist._force_ranges[assist.level]
+  complete = (
+    assist.pose_stage >= 2
+    and assist.level >= len(assist._force_ranges) - 1
+    and bool(torch.all(force_range == 0.0).item())
+  )
+  active_weights = complete_weights if complete else {}
+  if assist.pose_stage >= 2 and assist.level >= assist_level and not complete:
+    active_weights = assist_weights
+  applied_weights: dict[str, torch.Tensor] = {
+    "active": torch.tensor(float(bool(active_weights)), device=env.device),
+    "complete": torch.tensor(float(complete), device=env.device),
+  }
+  reward_names = set(assist_weights) | set(complete_weights)
+  for reward_name in reward_names:
+    weight = active_weights.get(reward_name, 0.0)
+    env.reward_manager.get_term_cfg(reward_name).weight = weight
+    applied_weights[f"{reward_name}_weight"] = torch.tensor(weight, device=env.device)
+  return applied_weights
 
 
 def prepare_recovery_group(

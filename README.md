@@ -45,6 +45,7 @@ Train a Unitree G1 humanoid to follow velocity commands on flat terrain:
 ```bash
 uv run train Mjlab-Velocity-Flat-RL_BOY --env.scene.num-envs 4096
 ```
+python src/mjlab/scripts/train.py Mjlab-Tracking-Flat-RL_BOY --env.scene.num-envs 4096
 
 **Multi-GPU Training:** Scale to multiple GPUs using `--gpu-ids`:
 
@@ -68,6 +69,7 @@ Train a humanoid to mimic reference motions. See the [motion imitation guide](ht
 
 ```bash
 python src/mjlab/scripts/train.py Mjlab-Tracking-Flat-RL_BOY --env.commands.motion.motion-file '/home/rx03116/GithubItems/mjlab/motions/jump616.npz' --env.scene.num-envs 4096
+
 uv run train Mjlab-Tracking-Flat-RL_BOY --registry-name your-org/motions/motion-name --env.scene.num-envs 4096
 uv run play Mjlab-Tracking-Flat-RL_BOY --wandb-run-path your-org/mjlab/run-id
 ```

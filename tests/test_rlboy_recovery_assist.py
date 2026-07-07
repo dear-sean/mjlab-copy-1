@@ -1,7 +1,12 @@
 """Tests for the RL_BOY fallen-recovery assistance curriculum."""
 
+from types import SimpleNamespace
+from typing import Any, cast
+
 import torch
 
+from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.velocity.config.rlboy.env_cfgs import (
   _smoothstep,
   gated_track_angular_velocity,
@@ -14,7 +19,9 @@ from mjlab.tasks.velocity.config.rlboy.env_cfgs import (
 from mjlab.tasks.velocity.config.rlboy.recovery_assist import (
   RECOVERY_ASSIST_EVENT_NAME,
   RlBoyRecoveryAssist,
+  actuator_torque_limit_excess_penalty,
   recovery_assist_curriculum,
+  recovery_assist_reward_weight_curriculum,
 )
 from mjlab.tasks.velocity.config.rlboy.rl_cfg import rlboy_ppo_runner_cfg
 
@@ -65,8 +72,26 @@ def test_flat_rlboy_enables_recovery_assist_only_during_training() -> None:
   )
   assert "command_name" not in assist_cfg.params
   assert train_cfg.curriculum["recovery_assist"].func is recovery_assist_curriculum
-  assert train_cfg.curriculum["recovery_assist"].params["window_size"] == 300
+  assert train_cfg.curriculum["recovery_assist"].params["window_size"] == 500
   assert train_cfg.curriculum["recovery_assist"].params["success_threshold"] == 0.9
+  assert (
+    train_cfg.rewards["continuous_torque_excess"].func
+    is actuator_torque_limit_excess_penalty
+  )
+  assert train_cfg.rewards["continuous_torque_excess"].weight == 0.0
+  assert train_cfg.rewards["peak_torque_saturation"].weight == 0.0
+  assert train_cfg.rewards["peak_torque_saturation"].params["threshold_ratio"] == 0.85
+  torque_curriculum = train_cfg.curriculum["torque_penalties"]
+  assert torque_curriculum.func is recovery_assist_reward_weight_curriculum
+  assert torque_curriculum.params["assist_level"] == 6
+  assert torque_curriculum.params["assist_weights"] == {
+    "continuous_torque_excess": -0.01,
+    "peak_torque_saturation": -0.01,
+  }
+  assert torque_curriculum.params["complete_weights"] == {
+    "continuous_torque_excess": -0.03,
+    "peak_torque_saturation": -0.02,
+  }
   assert not train_cfg.curriculum["command_vel"].log
   assert "mean_action_acc" not in train_cfg.metrics
   for reward_name in (
@@ -138,27 +163,203 @@ def test_recovery_pose_stages_advance_before_assistance_level() -> None:
   assist.level = 0
   assist.pose_stage = 0
   assist._force_ranges = torch.tensor(((50.0, 50.0), (40.0, 45.0), (32.0, 38.0)))
-  assist.attempts = torch.tensor(300)
-  assist.successes = torch.tensor(270)
+  assist.attempts = torch.tensor(500)
+  assist.successes = torch.tensor(450)
 
-  assist.update_level(window_size=300, success_threshold=0.9)
+  assist.update_level(window_size=500, success_threshold=0.9)
   assert assist.pose_stage == 1
   assert assist.level == 0
   assert assist.attempts == 0
 
-  assist.attempts = torch.tensor(300)
-  assist.successes = torch.tensor(269)
-  assist.update_level(window_size=300, success_threshold=0.9)
+  assist.attempts = torch.tensor(500)
+  assist.successes = torch.tensor(449)
+  assist.update_level(window_size=500, success_threshold=0.9)
   assert assist.pose_stage == 1
-  assert assist.attempts == 300
+  assert assist.attempts == 0
 
-  assist.successes = torch.tensor(270)
-  assist.update_level(window_size=300, success_threshold=0.9)
+  assist.attempts = torch.tensor(500)
+  assist.successes = torch.tensor(450)
+  assist.update_level(window_size=500, success_threshold=0.9)
   assert assist.pose_stage == 2
-  assist.attempts = torch.tensor(300)
-  assist.successes = torch.tensor(285)
-  assist.update_level(window_size=300, success_threshold=0.9)
+  assist.attempts = torch.tensor(500)
+  assist.successes = torch.tensor(475)
+  assist.update_level(window_size=500, success_threshold=0.9)
   assert assist.level == 1
+
+
+def test_torque_limit_penalty_only_counts_excess() -> None:
+  asset = SimpleNamespace(
+    actuator_names=(
+      "left_shoulder_pitch_joint",
+      "left_hip_pitch_joint",
+      "left_ankle_pitch_joint",
+    ),
+    data=SimpleNamespace(
+      actuator_force=torch.tensor(
+        (
+          (0.8, 8.0, 4.0),
+          (1.6, 12.0, 2.0),
+        )
+      )
+    ),
+  )
+  env = SimpleNamespace(
+    device="cpu",
+    scene={"robot": asset},
+    extras={"log": {}},
+  )
+  cfg = RewardTermCfg(
+    func=actuator_torque_limit_excess_penalty,
+    weight=1.0,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", actuator_ids=[0, 1, 2]),
+      "limit_by_actuator": {
+        r".*shoulder.*": 0.8,
+        r".*hip.*": 8.0,
+        r".*ankle.*": 4.0,
+      },
+    },
+  )
+
+  penalty = actuator_torque_limit_excess_penalty(cfg, cast(Any, env))
+
+  assert torch.allclose(
+    penalty(cast(Any, env), **cfg.params), torch.tensor((0.0, 1.25))
+  )
+
+
+def test_peak_torque_penalty_starts_near_saturation() -> None:
+  asset = SimpleNamespace(
+    actuator_names=(
+      "left_shoulder_pitch_joint",
+      "left_hip_pitch_joint",
+      "left_ankle_pitch_joint",
+    ),
+    data=SimpleNamespace(
+      actuator_force=torch.tensor(
+        (
+          (3.0 * 0.85, 20.0 * 0.85, 11.0 * 0.85),
+          (3.0, 20.0, 11.0),
+        )
+      )
+    ),
+  )
+  env = SimpleNamespace(
+    device="cpu",
+    scene={"robot": asset},
+    extras={"log": {}},
+  )
+  cfg = RewardTermCfg(
+    func=actuator_torque_limit_excess_penalty,
+    weight=1.0,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", actuator_ids=[0, 1, 2]),
+      "limit_by_actuator": {
+        r".*shoulder.*": 3.0,
+        r".*hip.*": 20.0,
+        r".*ankle.*": 11.0,
+      },
+      "threshold_ratio": 0.85,
+    },
+  )
+
+  penalty = actuator_torque_limit_excess_penalty(cfg, cast(Any, env))
+
+  assert torch.allclose(
+    penalty(cast(Any, env), **cfg.params), torch.tensor((0.0, 3 * 0.15**2))
+  )
+
+
+def test_torque_penalty_curriculum_tracks_recovery_assist_progress() -> None:
+  assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
+  assist.pose_stage = 2
+  assist.level = 5
+  assist._force_ranges = torch.tensor(
+    (
+      (50.0, 50.0),
+      (40.0, 45.0),
+      (32.0, 38.0),
+      (25.0, 30.0),
+      (20.0, 24.0),
+      (12.0, 19.0),
+      (6.0, 11.0),
+      (0.0, 5.0),
+      (0.0, 0.0),
+    )
+  )
+  reward_cfgs: dict[str, Any] = {
+    "continuous_torque_excess": SimpleNamespace(weight=123.0),
+    "peak_torque_saturation": SimpleNamespace(weight=456.0),
+  }
+  env = SimpleNamespace(
+    device="cpu",
+    event_manager=SimpleNamespace(
+      get_term_cfg=lambda name: SimpleNamespace(func=assist)
+    ),
+    reward_manager=SimpleNamespace(get_term_cfg=lambda name: reward_cfgs[name]),
+  )
+
+  state = recovery_assist_reward_weight_curriculum(
+    cast(Any, env),
+    torch.arange(1),
+    event_name=RECOVERY_ASSIST_EVENT_NAME,
+    assist_level=6,
+    assist_weights={
+      "continuous_torque_excess": -0.01,
+      "peak_torque_saturation": -0.01,
+    },
+    complete_weights={
+      "continuous_torque_excess": -0.03,
+      "peak_torque_saturation": -0.02,
+    },
+  )
+
+  assert state["active"] == 0.0
+  assert state["complete"] == 0.0
+  assert reward_cfgs["continuous_torque_excess"].weight == 0.0
+  assert reward_cfgs["peak_torque_saturation"].weight == 0.0
+
+  assist.level = 6
+  state = recovery_assist_reward_weight_curriculum(
+    cast(Any, env),
+    torch.arange(1),
+    event_name=RECOVERY_ASSIST_EVENT_NAME,
+    assist_level=6,
+    assist_weights={
+      "continuous_torque_excess": -0.01,
+      "peak_torque_saturation": -0.01,
+    },
+    complete_weights={
+      "continuous_torque_excess": -0.03,
+      "peak_torque_saturation": -0.02,
+    },
+  )
+
+  assert state["active"] == 1.0
+  assert state["complete"] == 0.0
+  assert reward_cfgs["continuous_torque_excess"].weight == -0.01
+  assert reward_cfgs["peak_torque_saturation"].weight == -0.01
+
+  assist.level = 8
+  state = recovery_assist_reward_weight_curriculum(
+    cast(Any, env),
+    torch.arange(1),
+    event_name=RECOVERY_ASSIST_EVENT_NAME,
+    assist_level=6,
+    assist_weights={
+      "continuous_torque_excess": -0.01,
+      "peak_torque_saturation": -0.01,
+    },
+    complete_weights={
+      "continuous_torque_excess": -0.03,
+      "peak_torque_saturation": -0.02,
+    },
+  )
+
+  assert state["active"] == 1.0
+  assert state["complete"] == 1.0
+  assert reward_cfgs["continuous_torque_excess"].weight == -0.03
+  assert reward_cfgs["peak_torque_saturation"].weight == -0.02
 
 
 def test_recovery_angle_noise_is_disabled_then_smoothly_enabled() -> None:

@@ -30,11 +30,13 @@ from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.config.rlboy.recovery_assist import (
   RECOVERY_ASSIST_EVENT_NAME,
   RlBoyRecoveryAssist,
+  actuator_torque_limit_excess_penalty,
   normal_group_payload,
   normal_randomization_curriculum,
   prepare_recovery_group,
   push_normal_group,
   recovery_assist_curriculum,
+  recovery_assist_reward_weight_curriculum,
   recovery_failure_penalty,
   recovery_succeeded,
   recovery_timed_out,
@@ -85,6 +87,17 @@ _RECOVERY_CSV_JOINT_NAMES = (
   "right_shoulder_yaw_joint",
   "right_elbow_pitch_joint",
 )
+
+_CONTINUOUS_TORQUE_LIMIT_BY_ACTUATOR = {
+  r".*_(shoulder|elbow).*": 0.8,
+  r".*_(hip|knee).*": 8.0,
+  r"(waist_yaw_joint|head_yaw_joint|.*_ankle_pitch_joint)": 4.0,
+}
+_PEAK_TORQUE_LIMIT_BY_ACTUATOR = {
+  r".*_(shoulder|elbow).*": 3.0,
+  r".*_(hip|knee).*": 20.0,
+  r"(waist_yaw_joint|head_yaw_joint|.*_ankle_pitch_joint)": 11.0,
+}
 
 _RECOVERY_GATE_PARAMS = {
   "height_low": 0.24,
@@ -1171,6 +1184,26 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       weight=-2.0,
       params={"event_name": RECOVERY_ASSIST_EVENT_NAME},
     )
+    cfg.rewards["continuous_torque_excess"] = RewardTermCfg(
+      func=actuator_torque_limit_excess_penalty,
+      weight=0.0,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "limit_by_actuator": _CONTINUOUS_TORQUE_LIMIT_BY_ACTUATOR,
+        "threshold_ratio": 1.0,
+        "log_prefix": "continuous_torque_excess",
+      },
+    )
+    cfg.rewards["peak_torque_saturation"] = RewardTermCfg(
+      func=actuator_torque_limit_excess_penalty,
+      weight=0.0,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "limit_by_actuator": _PEAK_TORQUE_LIMIT_BY_ACTUATOR,
+        "threshold_ratio": 0.85,
+        "log_prefix": "peak_torque_saturation",
+      },
+    )
     cfg.terminations["recovery_succeeded"] = TerminationTermCfg(
       func=recovery_succeeded,
       time_out=True,
@@ -1184,8 +1217,23 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       func=recovery_assist_curriculum,
       params={
         "event_name": RECOVERY_ASSIST_EVENT_NAME,
-        "window_size": 300,
+        "window_size": 500,
         "success_threshold": 0.9,
+      },
+    )
+    cfg.curriculum["torque_penalties"] = CurriculumTermCfg(
+      func=recovery_assist_reward_weight_curriculum,
+      params={
+        "event_name": RECOVERY_ASSIST_EVENT_NAME,
+        "assist_level": 6,
+        "assist_weights": {
+          "continuous_torque_excess": -0.01,
+          "peak_torque_saturation": -0.01,
+        },
+        "complete_weights": {
+          "continuous_torque_excess": -0.03,
+          "peak_torque_saturation": -0.02,
+        },
       },
     )
     cfg.curriculum["normal_randomization"] = CurriculumTermCfg(
