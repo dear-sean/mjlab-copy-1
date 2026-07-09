@@ -973,11 +973,10 @@ def rlboy_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     },
   )
 
-  # 倒地时长惩罚：base_height < 0.38 时持续累加，200 步饱和
-  # 与 base_height_recovery 配合：瞬时高度惩罚 + 拖延不恢复的额外惩罚
+  # 倒地时长指标：保留日志项，但不惩罚拖延起身，避免鼓励过猛恢复。
   cfg.rewards["fallen_duration"] = RewardTermCfg(
     func=fallen_duration_penalty,
-    weight=-0.05,
+    weight=0.0,
     params={
       "threshold": 0.38,
       "tau": 50.0,  # step=50 → raw≈1.72，step=200 → penalty→max_penalty
