@@ -15,6 +15,8 @@ from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
@@ -43,6 +45,7 @@ from mjlab.tasks.velocity.config.rlboy.recovery_assist import (
 )
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
+from mjlab.utils.string import resolve_expr
 
 _FALLEN_POSES = [
   {
@@ -102,6 +105,7 @@ _PEAK_TORQUE_LIMIT_BY_ACTUATOR = {
   r".*_(hip|knee).*": 20.0,
   r"(waist_yaw_joint|head_yaw_joint|.*_ankle_pitch_joint)": 11.0,
 }
+_TORQUE_FEEDBACK_HISTORY_LENGTH = 4
 
 _RECOVERY_GATE_PARAMS = {
   "height_low": 0.24,
@@ -177,6 +181,150 @@ _NORMAL_RANDOMIZATION_STAGES = [
 if TYPE_CHECKING:
   from mjlab.entity import Entity
   from mjlab.envs import ManagerBasedRlEnv
+
+
+def _selected_names(names: tuple[str, ...], ids: list[int] | slice) -> tuple[str, ...]:
+  if isinstance(ids, slice):
+    return names[ids]
+  return tuple(names[index] for index in ids)
+
+
+class _ActuatorLimitTerm:
+  def __init__(self, cfg, env: "ManagerBasedRlEnv"):
+    self._asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+    self._asset: "Entity" = env.scene[self._asset_cfg.name]
+    actuator_names = _selected_names(
+      self._asset.actuator_names, self._asset_cfg.actuator_ids
+    )
+    limits = resolve_expr(cfg.params["limit_by_actuator"], actuator_names)
+    if any(limit is None for limit in limits):
+      missing = [
+        name
+        for name, limit in zip(actuator_names, limits, strict=True)
+        if limit is None
+      ]
+      raise ValueError(f"Missing torque limit for actuator(s): {missing}")
+    self._limits = torch.tensor(limits, device=env.device, dtype=torch.float32)
+    if bool((self._limits <= 0.0).any()):
+      raise ValueError("Torque limits must be positive.")
+
+  def _applied_ratio(self) -> torch.Tensor:
+    torques = self._asset.data.actuator_force[:, self._asset_cfg.actuator_ids]
+    return torques / self._limits
+
+
+class applied_actuator_torque_ratio(_ActuatorLimitTerm):
+  """Applied actuator force normalized by a configured per-actuator limit."""
+
+  def __call__(
+    self,
+    env: "ManagerBasedRlEnv",
+    asset_cfg: SceneEntityCfg,
+    limit_by_actuator: dict[str, float],
+  ) -> torch.Tensor:
+    del env, asset_cfg, limit_by_actuator
+    return self._applied_ratio()
+
+
+class max_abs_applied_actuator_torque_ratio(_ActuatorLimitTerm):
+  """Maximum absolute applied torque ratio for each environment."""
+
+  def __call__(
+    self,
+    env: "ManagerBasedRlEnv",
+    asset_cfg: SceneEntityCfg,
+    limit_by_actuator: dict[str, float],
+  ) -> torch.Tensor:
+    del env, asset_cfg, limit_by_actuator
+    return torch.max(torch.abs(self._applied_ratio()), dim=1).values
+
+
+class requested_actuator_torque_ratio(_ActuatorLimitTerm):
+  """Unclipped position-actuator torque request normalized by actuator limit."""
+
+  def __init__(self, cfg, env: "ManagerBasedRlEnv"):
+    super().__init__(cfg, env)
+    actuator_names = _selected_names(
+      self._asset.actuator_names, self._asset_cfg.actuator_ids
+    )
+    joint_id_by_name = {name: i for i, name in enumerate(self._asset.joint_names)}
+    try:
+      joint_ids = [joint_id_by_name[name] for name in actuator_names]
+    except KeyError as exc:
+      raise ValueError(
+        "requested_actuator_torque_ratio only supports joint position actuators "
+        "whose actuator names match their joint names."
+      ) from exc
+    self._joint_ids = torch.tensor(joint_ids, device=env.device, dtype=torch.long)
+    self._global_ctrl_ids = self._asset.indexing.ctrl_ids[
+      self._asset_cfg.actuator_ids
+    ].long()
+
+  def __call__(
+    self,
+    env: "ManagerBasedRlEnv",
+    asset_cfg: SceneEntityCfg,
+    limit_by_actuator: dict[str, float],
+  ) -> torch.Tensor:
+    del asset_cfg, limit_by_actuator
+    target = self._asset.data.joint_pos_target[:, self._joint_ids]
+    pos = self._asset.data.joint_pos[:, self._joint_ids]
+    vel = self._asset.data.joint_vel[:, self._joint_ids]
+
+    gain = env.sim.model.actuator_gainprm[:, self._global_ctrl_ids, 0]
+    bias = env.sim.model.actuator_biasprm[:, self._global_ctrl_ids, :]
+    requested = gain * target + bias[:, :, 0] + bias[:, :, 1] * pos
+    requested += bias[:, :, 2] * vel
+    return requested / self._limits
+
+
+def _set_feedback_observation_history(cfg: ManagerBasedRlEnvCfg) -> None:
+  history_terms = (
+    "joint_pos",
+    "joint_vel",
+    "actions",
+    "applied_torque_continuous_ratio",
+    "applied_torque_peak_ratio",
+    "requested_torque_peak_ratio",
+  )
+  for group_name in ("actor", "critic"):
+    terms = cfg.observations[group_name].terms
+    for term_name in history_terms:
+      if term_name in terms:
+        terms[term_name].history_length = _TORQUE_FEEDBACK_HISTORY_LENGTH
+        terms[term_name].flatten_history_dim = True
+
+
+def _add_torque_feedback_observations(cfg: ManagerBasedRlEnvCfg) -> None:
+  for group_name in ("actor", "critic"):
+    terms = cfg.observations[group_name].terms
+    terms["applied_torque_continuous_ratio"] = ObservationTermCfg(
+      func=applied_actuator_torque_ratio,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "limit_by_actuator": _CONTINUOUS_TORQUE_LIMIT_BY_ACTUATOR,
+      },
+      clip=(-2.0, 2.0),
+      history_length=_TORQUE_FEEDBACK_HISTORY_LENGTH,
+    )
+    terms["applied_torque_peak_ratio"] = ObservationTermCfg(
+      func=applied_actuator_torque_ratio,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "limit_by_actuator": _PEAK_TORQUE_LIMIT_BY_ACTUATOR,
+      },
+      clip=(-1.0, 1.0),
+      history_length=_TORQUE_FEEDBACK_HISTORY_LENGTH,
+    )
+    terms["requested_torque_peak_ratio"] = ObservationTermCfg(
+      func=requested_actuator_torque_ratio,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "limit_by_actuator": _PEAK_TORQUE_LIMIT_BY_ACTUATOR,
+      },
+      clip=(-2.0, 2.0),
+      history_length=_TORQUE_FEEDBACK_HISTORY_LENGTH,
+    )
 
 
 def base_height_penalty_recovery(
@@ -747,6 +895,15 @@ def rlboy_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # 替换机器人实体
   cfg.scene.entities = {"robot": get_rlboy_robot_cfg()}
+  _add_torque_feedback_observations(cfg)
+  _set_feedback_observation_history(cfg)
+  cfg.metrics["applied_torque_continuous_ratio"] = MetricsTermCfg(
+    func=max_abs_applied_actuator_torque_ratio,
+    params={
+      "asset_cfg": SceneEntityCfg("robot"),
+      "limit_by_actuator": _CONTINUOUS_TORQUE_LIMIT_BY_ACTUATOR,
+    },
+  )
 
   # 设置地形射线扫描传感器帧为 RL_BOY 的 base_link
   # 注意: RL_BOY 没有 pelvis，使用 base_link 作为主躯干

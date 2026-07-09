@@ -38,6 +38,12 @@ Added
   terminate after five seconds and receive a single modest failure penalty.
   Fallen resets also randomize root height and velocity plus per-joint position
   and velocity within conservative, joint-specific ranges.
+- Added torque-feedback observations to the RL_BOY velocity task. Actor and
+  critic observations now include applied continuous-limit torque ratio, applied
+  peak-limit torque ratio, and requested peak-limit torque ratio with four-step
+  history on torque, joint-state, and previous-action feedback. The RL_BOY
+  velocity training log also tracks applied continuous-limit torque ratio as a
+  metric.
 - Added ``--log-root`` CLI option to ``train``, ``play``, and ``evaluate``
   scripts for choosing where training logs are stored. Defaults to
   ``logs/rsl_rl`` (unchanged behavior). Useful for directing outputs to a
