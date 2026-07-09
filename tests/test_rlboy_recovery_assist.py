@@ -46,14 +46,23 @@ def test_flat_rlboy_enables_recovery_assist_only_during_training() -> None:
     (0.0, 0.0),
   )
   assert assist_cfg.params["upright_height"] == 0.38
-  assert assist_cfg.params["stage_three_weights"] == (0.3, 0.4, 0.3)
+  assert assist_cfg.params["frame_files"] == (
+    "getup*.csv",
+    "fall*.csv",
+  )
+  assert assist_cfg.params["source_names"] == ("getup", "fall", "canonical")
+  assert assist_cfg.params["pose_stage_source_weights"] == (
+    (1.0, 0.0, 0.0),
+    (1.0, 0.0, 0.0),
+    (0.15, 0.25, 0.6),
+  )
   assert assist_cfg.params["angle_noise_ramp_attempts"] == 300
   assert assist_cfg.params["recovery_stage_probabilities"] == (0.6, 0.5, 0.4)
   assert assist_cfg.params["post_stage_recovery_probability"] == 0.35
   assert assist_cfg.params["low_force_recovery_probability"] == 0.3
   assert assist_cfg.params["recovery_probability_limits"] == (0.25, 0.65)
   assert assist_cfg.params["recovery_probability_min_attempts"] == 50
-  assert assist_cfg.params["frame_dir"].endswith("motions/getup_frame_data")
+  assert assist_cfg.params["frame_dir"].endswith("motions72/motions/getup_frame_data")
   assert len(assist_cfg.params["csv_joint_names"]) == 20
   assert assist_cfg.params["upright_angle"] == torch.deg2rad(torch.tensor(15.0))
   assert assist_cfg.params["fall_height"] == 0.24
@@ -85,11 +94,11 @@ def test_flat_rlboy_enables_recovery_assist_only_during_training() -> None:
   assert torque_curriculum.func is recovery_assist_reward_weight_curriculum
   assert torque_curriculum.params["assist_level"] == 6
   assert torque_curriculum.params["assist_weights"] == {
-    "continuous_torque_excess": -0.01,
+    "continuous_torque_excess": -0.02,
     "peak_torque_saturation": -0.01,
   }
   assert torque_curriculum.params["complete_weights"] == {
-    "continuous_torque_excess": -0.03,
+    "continuous_torque_excess": -0.05,
     "peak_torque_saturation": -0.02,
   }
   assert not train_cfg.curriculum["command_vel"].log
@@ -108,6 +117,7 @@ def test_flat_rlboy_enables_recovery_assist_only_during_training() -> None:
   assert (
     train_cfg.rewards["track_angular_velocity"].func is gated_track_angular_velocity
   )
+  assert train_cfg.rewards["action_rate_l2"].weight == -0.03
   assert train_cfg.rewards["recovery_progress"].func is recovery_progress_reward
   assert train_cfg.rewards["upright"].func is gated_upright
   assert train_cfg.rewards["upright"].params["gate_min_scale"] == 0.5
@@ -162,6 +172,7 @@ def test_recovery_pose_stages_advance_before_assistance_level() -> None:
   assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
   assist.level = 0
   assist.pose_stage = 0
+  assist._pose_stage_source_weights = torch.zeros(3, 3)
   assist._force_ranges = torch.tensor(((50.0, 50.0), (40.0, 45.0), (32.0, 38.0)))
   assist.attempts = torch.tensor(500)
   assist.successes = torch.tensor(450)
@@ -181,9 +192,11 @@ def test_recovery_pose_stages_advance_before_assistance_level() -> None:
   assist.successes = torch.tensor(450)
   assist.update_level(window_size=500, success_threshold=0.9)
   assert assist.pose_stage == 2
+
   assist.attempts = torch.tensor(500)
   assist.successes = torch.tensor(475)
   assist.update_level(window_size=500, success_threshold=0.9)
+  assert assist.pose_stage == 2
   assert assist.level == 1
 
 
@@ -305,11 +318,11 @@ def test_torque_penalty_curriculum_tracks_recovery_assist_progress() -> None:
     event_name=RECOVERY_ASSIST_EVENT_NAME,
     assist_level=6,
     assist_weights={
-      "continuous_torque_excess": -0.01,
+      "continuous_torque_excess": -0.02,
       "peak_torque_saturation": -0.01,
     },
     complete_weights={
-      "continuous_torque_excess": -0.03,
+      "continuous_torque_excess": -0.05,
       "peak_torque_saturation": -0.02,
     },
   )
@@ -326,18 +339,18 @@ def test_torque_penalty_curriculum_tracks_recovery_assist_progress() -> None:
     event_name=RECOVERY_ASSIST_EVENT_NAME,
     assist_level=6,
     assist_weights={
-      "continuous_torque_excess": -0.01,
+      "continuous_torque_excess": -0.02,
       "peak_torque_saturation": -0.01,
     },
     complete_weights={
-      "continuous_torque_excess": -0.03,
+      "continuous_torque_excess": -0.05,
       "peak_torque_saturation": -0.02,
     },
   )
 
   assert state["active"] == 1.0
   assert state["complete"] == 0.0
-  assert reward_cfgs["continuous_torque_excess"].weight == -0.01
+  assert reward_cfgs["continuous_torque_excess"].weight == -0.02
   assert reward_cfgs["peak_torque_saturation"].weight == -0.01
 
   assist.level = 8
@@ -347,18 +360,18 @@ def test_torque_penalty_curriculum_tracks_recovery_assist_progress() -> None:
     event_name=RECOVERY_ASSIST_EVENT_NAME,
     assist_level=6,
     assist_weights={
-      "continuous_torque_excess": -0.01,
+      "continuous_torque_excess": -0.02,
       "peak_torque_saturation": -0.01,
     },
     complete_weights={
-      "continuous_torque_excess": -0.03,
+      "continuous_torque_excess": -0.05,
       "peak_torque_saturation": -0.02,
     },
   )
 
   assert state["active"] == 1.0
   assert state["complete"] == 1.0
-  assert reward_cfgs["continuous_torque_excess"].weight == -0.03
+  assert reward_cfgs["continuous_torque_excess"].weight == -0.05
   assert reward_cfgs["peak_torque_saturation"].weight == -0.02
 
 
@@ -388,10 +401,10 @@ def test_recovery_csv_quaternion_is_reordered_and_normalized() -> None:
   assist = RlBoyRecoveryAssist.__new__(RlBoyRecoveryAssist)
   assist._env = type("Env", (), {"device": "cpu"})()
   assist.sample_source = torch.tensor((0,))
-  assist._getup_frames = torch.tensor(
-    [[0.0, 0.0, 0.2, 1.0, 2.0, 3.0, 4.0, *([0.0] * 20)]]
+  assist._csv_frames = (
+    torch.tensor([[0.0, 0.0, 0.2, 1.0, 2.0, 3.0, 4.0, *([0.0] * 20)]]),
   )
-  assist._fall_frames = assist._getup_frames
+  assist._canonical_source = 1
   assist._poses = [{"pos": (0.0, 0.0, 0.1), "quat": (1.0, 0.0, 0.0, 0.0)}]
   assist._root_height_range = (0.1, 0.13)
 
@@ -433,6 +446,13 @@ def test_recovery_group_probability_tracks_stage_and_success() -> None:
   assert torch.isclose(torch.tensor(assist._recovery_probability), torch.tensor(0.6))
 
   assist.pose_stage = 2
+  assist.level = 0
+  assist.attempts = torch.tensor(0)
+  assist.update_recovery_probability(success_target=0.9)
+  assert torch.isclose(
+    torch.tensor(assist._target_recovery_probability), torch.tensor(0.4)
+  )
+
   assist.level = 1
   assist.attempts = torch.tensor(100)
   assist.successes = torch.tensor(100)
@@ -440,7 +460,7 @@ def test_recovery_group_probability_tracks_stage_and_success() -> None:
   assert torch.isclose(
     torch.tensor(assist._target_recovery_probability), torch.tensor(0.3)
   )
-  assert torch.isclose(torch.tensor(assist._recovery_probability), torch.tensor(0.57))
+  assert torch.isclose(torch.tensor(assist._recovery_probability), torch.tensor(0.552))
 
   assist.level = 8
   assist.attempts = torch.tensor(0)
@@ -473,8 +493,21 @@ def test_rlboy_curricula_fit_four_thousand_iterations() -> None:
   ]
   assert [stage["payload_range"][1] for stage in randomization_stages] == [
     0.0,
+    0.125,
     0.25,
     0.5,
     1.0,
-    2.0,
+  ]
+  assert [
+    max(
+      (max(abs(low), abs(high)) for low, high in stage["velocity_range"].values()),
+      default=0.0,
+    )
+    for stage in randomization_stages
+  ] == [
+    0.0,
+    0.0,
+    0.06,
+    0.16,
+    0.5,
   ]

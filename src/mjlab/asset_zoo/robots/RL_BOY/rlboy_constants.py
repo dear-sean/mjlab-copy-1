@@ -93,7 +93,7 @@ ACTUATOR_J8006 = ElectricActuator(
 )
 
 NATURAL_FREQ = 10 * 2.0 * 3.1415926535  # 10Hz 固有角频率,腿软时增大
-DAMPING_RATIO = 2.0
+DAMPING_RATIO = 1.8
 
 # 刚度计算: K = J_ref * ω_n²
 STIFFNESS_J3507 = ARMATURE_J3507 * (NATURAL_FREQ**2)

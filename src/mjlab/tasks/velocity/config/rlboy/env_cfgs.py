@@ -63,7 +63,11 @@ _FALLEN_POSES = [
   },
 ]
 _RECOVERY_FRAME_DIR = (
-  Path(__file__).resolve().parents[6] / "motions" / "getup_frame_data"
+  Path(__file__).resolve().parents[6] / "motions72" / "motions" / "getup_frame_data"
+)
+_RECOVERY_FRAME_FILES = (
+  "getup*.csv",
+  "fall*.csv",
 )
 _RECOVERY_CSV_JOINT_NAMES = (
   "left_hip_yaw_joint",
@@ -129,42 +133,42 @@ _NORMAL_RANDOMIZATION_STAGES = [
   },
   {
     "step": 1200 * 24,
-    "payload_range": (0.0, 0.25),
+    "payload_range": (0.0, 0.125),
     "velocity_range": {},
     "push_interval_s": (8.0, 12.0),
   },
   {
     "step": 2000 * 24,
-    "payload_range": (0.0, 0.5),
+    "payload_range": (0.0, 0.25),
     "velocity_range": {
-      "x": (-0.1, 0.1),
-      "y": (-0.1, 0.1),
-      "yaw": (-0.1, 0.1),
+      "x": (-0.06, 0.06),
+      "y": (-0.06, 0.06),
+      "yaw": (-0.06, 0.06),
     },
     "push_interval_s": (8.0, 12.0),
   },
   {
     "step": 2800 * 24,
-    "payload_range": (0.0, 1.0),
+    "payload_range": (0.0, 0.5),
     "velocity_range": {
-      "x": (-0.25, 0.25),
-      "y": (-0.25, 0.25),
-      "roll": (-0.1, 0.1),
-      "pitch": (-0.1, 0.1),
-      "yaw": (-0.2, 0.2),
+      "x": (-0.16, 0.16),
+      "y": (-0.16, 0.16),
+      "roll": (-0.06, 0.06),
+      "pitch": (-0.06, 0.06),
+      "yaw": (-0.13, 0.13),
     },
     "push_interval_s": (6.0, 10.0),
   },
   {
     "step": 3400 * 24,
-    "payload_range": (0.0, 2.0),
+    "payload_range": (0.0, 1.0),
     "velocity_range": {
-      "x": (-0.5, 0.5),
-      "y": (-0.5, 0.5),
-      "z": (-0.4, 0.4),
-      "roll": (-0.52, 0.52),
-      "pitch": (-0.52, 0.52),
-      "yaw": (-0.78, 0.78),
+      "x": (-0.32, 0.32),
+      "y": (-0.32, 0.32),
+      "z": (-0.26, 0.26),
+      "roll": (-0.33, 0.33),
+      "pitch": (-0.33, 0.33),
+      "yaw": (-0.5, 0.5),
     },
     "push_interval_s": (1.0, 3.0),
   },
@@ -921,7 +925,7 @@ def rlboy_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # 奖励权重调整
   cfg.rewards["pose"].weight = 0.5
-  cfg.rewards["action_rate_l2"].weight = -0.05
+  cfg.rewards["action_rate_l2"].weight = -0.03
   cfg.rewards["body_ang_vel"].weight = -0.05
   cfg.rewards["angular_momentum"].weight = -0.02
   cfg.rewards["air_time"].weight = 0.2
@@ -1064,8 +1068,14 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "recovery_probability_min_attempts": 50,
         "angle_noise_ramp_attempts": 300,
         "frame_dir": str(_RECOVERY_FRAME_DIR),
+        "frame_files": _RECOVERY_FRAME_FILES,
+        "source_names": ("getup", "fall", "canonical"),
         "csv_joint_names": _RECOVERY_CSV_JOINT_NAMES,
-        "stage_three_weights": (0.3, 0.4, 0.3),
+        "pose_stage_source_weights": (
+          (1.0, 0.0, 0.0),
+          (1.0, 0.0, 0.0),
+          (0.15, 0.25, 0.6),
+        ),
         "force_ranges": (
           (50.0, 50.0),
           (40.0, 45.0),
@@ -1227,11 +1237,11 @@ def rlboy_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "event_name": RECOVERY_ASSIST_EVENT_NAME,
         "assist_level": 6,
         "assist_weights": {
-          "continuous_torque_excess": -0.01,
+          "continuous_torque_excess": -0.02,
           "peak_torque_saturation": -0.01,
         },
         "complete_weights": {
-          "continuous_torque_excess": -0.03,
+          "continuous_torque_excess": -0.05,
           "peak_torque_saturation": -0.02,
         },
       },

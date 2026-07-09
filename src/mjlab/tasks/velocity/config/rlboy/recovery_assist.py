@@ -99,7 +99,7 @@ class RlBoyRecoveryAssist:
     self._asset: Entity = env.scene[params["asset_cfg"].name]
     self._body_ids = params["asset_cfg"].body_ids
     self._poses: list[dict[str, tuple[float, ...]]] = params["poses"]
-    self._recovery_stage_probabilities: tuple[float, float, float] = params[
+    self._recovery_stage_probabilities: tuple[float, ...] = params[
       "recovery_stage_probabilities"
     ]
     self._post_stage_recovery_probability: float = params[
@@ -121,8 +121,8 @@ class RlBoyRecoveryAssist:
       "recovery_probability_min_attempts"
     ]
     self._angle_noise_ramp_attempts: int = params["angle_noise_ramp_attempts"]
-    self._stage_three_weights = torch.tensor(
-      params["stage_three_weights"], device=env.device, dtype=torch.float32
+    self._pose_stage_source_weights = torch.tensor(
+      params["pose_stage_source_weights"], device=env.device, dtype=torch.float32
     )
     self._force_ranges = torch.tensor(
       params["force_ranges"], device=env.device, dtype=torch.float32
@@ -163,8 +163,14 @@ class RlBoyRecoveryAssist:
       dtype=torch.long,
     )
     frame_dir = Path(params["frame_dir"])
-    self._getup_frames = self._load_frames(frame_dir, "getup*.csv")
-    self._fall_frames = self._load_frames(frame_dir, "fall*.csv")
+    self._frame_files: tuple[str, ...] = params["frame_files"]
+    self._csv_frames = tuple(
+      self._load_frames(frame_dir, frame_file) for frame_file in self._frame_files
+    )
+    self._canonical_source = len(self._csv_frames)
+    self._source_names: tuple[str, ...] = params.get(
+      "source_names", (*self._frame_files, "canonical")
+    )
 
     self.level = 0
     self.pose_stage = 0
@@ -187,8 +193,10 @@ class RlBoyRecoveryAssist:
       raise ValueError("At least one canonical fallen pose is required.")
     if self._angle_noise_ramp_attempts <= 0:
       raise ValueError("angle_noise_ramp_attempts must be positive.")
-    if len(self._recovery_stage_probabilities) != 3:
-      raise ValueError("recovery_stage_probabilities must contain three values.")
+    if len(self._recovery_stage_probabilities) != len(self._pose_stage_source_weights):
+      raise ValueError(
+        "recovery_stage_probabilities must match pose_stage_source_weights."
+      )
     probability_values = (
       *self._recovery_stage_probabilities,
       self._post_stage_recovery_probability,
@@ -205,18 +213,29 @@ class RlBoyRecoveryAssist:
       raise ValueError("recovery_probability_feedback_gain cannot be negative.")
     if self._recovery_probability_min_attempts <= 0:
       raise ValueError("recovery_probability_min_attempts must be positive.")
-    if self._stage_three_weights.shape != (3,):
-      raise ValueError("stage_three_weights must contain getup, fall, canonical.")
-    if bool((self._stage_three_weights < 0.0).any()):
-      raise ValueError("stage_three_weights cannot contain negative values.")
-    if not torch.isclose(
-      self._stage_three_weights.sum(),
-      torch.tensor(1.0, device=env.device),
+    expected_source_count = len(self._csv_frames) + 1
+    if len(self._source_names) != expected_source_count:
+      raise ValueError("source_names must match CSV sources plus canonical poses.")
+    if self._pose_stage_source_weights.shape != (
+      len(self._recovery_stage_probabilities),
+      expected_source_count,
     ):
-      raise ValueError("stage_three_weights must sum to one.")
+      raise ValueError(
+        "pose_stage_source_weights must have one row per pose stage and "
+        "one column per CSV source plus canonical poses."
+      )
+    if bool((self._pose_stage_source_weights < 0.0).any()):
+      raise ValueError("pose_stage_source_weights cannot contain negative values.")
+    if not torch.allclose(
+      self._pose_stage_source_weights.sum(dim=1),
+      torch.ones(len(self._pose_stage_source_weights), device=env.device),
+    ):
+      raise ValueError("Each pose_stage_source_weights row must sum to one.")
     self.attempts = torch.zeros((), device=env.device, dtype=torch.long)
     self.successes = torch.zeros_like(self.attempts)
-    self.source_samples = torch.zeros(3, device=env.device, dtype=torch.long)
+    self.source_samples = torch.zeros(
+      expected_source_count, device=env.device, dtype=torch.long
+    )
 
   def _load_frames(self, frame_dir: Path, pattern: str) -> torch.Tensor:
     """Load and validate root pose plus joint position CSV frames once."""
@@ -288,7 +307,7 @@ class RlBoyRecoveryAssist:
       assert default_joint_vel is not None
       assert soft_joint_pos_limits is not None
       joint_pos = default_joint_pos[recovery_ids].clone()
-      csv_mask = self.sample_source[recovery_ids] != 2
+      csv_mask = self.sample_source[recovery_ids] != self._canonical_source
       if bool(csv_mask.any()):
         csv_rows = csv_mask.nonzero(as_tuple=False).squeeze(-1)
         joint_pos[csv_rows[:, None], self._csv_joint_ids[None, :]] = csv_joint_pos[
@@ -323,7 +342,7 @@ class RlBoyRecoveryAssist:
     root_quat = torch.zeros(count, 4, device=self._env.device)
     csv_joint_pos = torch.zeros(count, 20, device=self._env.device)
 
-    for source, frames in ((0, self._getup_frames), (1, self._fall_frames)):
+    for source, frames in enumerate(self._csv_frames):
       mask = sources == source
       sample_count = int(mask.sum().item())
       if sample_count == 0:
@@ -336,7 +355,7 @@ class RlBoyRecoveryAssist:
       root_quat[mask] = quat_xyzw[:, (3, 0, 1, 2)]
       csv_joint_pos[mask] = sampled[:, 7:27]
 
-    canonical_mask = sources == 2
+    canonical_mask = sources == self._canonical_source
     canonical_count = int(canonical_mask.sum().item())
     if canonical_count > 0:
       pose_ids = torch.randint(
@@ -374,7 +393,7 @@ class RlBoyRecoveryAssist:
   def _angle_noise_scale(self) -> float:
     if self.pose_stage == 0:
       return 0.0
-    if self.pose_stage == 2:
+    if self.pose_stage >= 2:
       return 1.0
     success_rate = float((self.successes.float() / self.attempts.clamp_min(1)).item())
     performance_scale = min(max((success_rate - 0.5) / 0.4, 0.0), 1.0)
@@ -404,14 +423,13 @@ class RlBoyRecoveryAssist:
     self.applied_force[env_ids] = 0.0
     self.sample_source[env_ids] = -1
     if len(recovery_ids) > 0:
-      if self.pose_stage < 2:
-        self.sample_source[recovery_ids] = 0
-      else:
-        self.sample_source[recovery_ids] = torch.multinomial(
-          self._stage_three_weights, len(recovery_ids), replacement=True
-        )
+      self.sample_source[recovery_ids] = torch.multinomial(
+        self._pose_stage_source_weights[self.pose_stage],
+        len(recovery_ids),
+        replacement=True,
+      )
       self.source_samples += torch.bincount(
-        self.sample_source[recovery_ids], minlength=3
+        self.sample_source[recovery_ids], minlength=len(self.source_samples)
       ).to(self.source_samples)
 
   def __call__(
@@ -420,7 +438,7 @@ class RlBoyRecoveryAssist:
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
     poses: list[dict[str, tuple[float, ...]]],
-    recovery_stage_probabilities: tuple[float, float, float],
+    recovery_stage_probabilities: tuple[float, ...],
     post_stage_recovery_probability: float,
     low_force_recovery_probability: float,
     recovery_probability_limits: tuple[float, float],
@@ -429,8 +447,10 @@ class RlBoyRecoveryAssist:
     recovery_probability_min_attempts: int,
     angle_noise_ramp_attempts: int,
     frame_dir: str,
+    frame_files: tuple[str, ...],
+    source_names: tuple[str, ...],
     csv_joint_names: tuple[str, ...],
-    stage_three_weights: tuple[float, float, float],
+    pose_stage_source_weights: tuple[tuple[float, ...], ...],
     force_ranges: tuple[tuple[float, float], ...],
     upright_height: float,
     upright_angle: float,
@@ -461,8 +481,10 @@ class RlBoyRecoveryAssist:
       recovery_probability_min_attempts,
       angle_noise_ramp_attempts,
       frame_dir,
+      frame_files,
+      source_names,
       csv_joint_names,
-      stage_three_weights,
+      pose_stage_source_weights,
       force_ranges,
       upright_height,
       upright_angle,
@@ -567,7 +589,7 @@ class RlBoyRecoveryAssist:
     if attempts < window_size:
       return
     if int(self.successes.item()) >= success_threshold * attempts:
-      if self.pose_stage < 2:
+      if self.pose_stage < len(self._pose_stage_source_weights) - 1:
         self.pose_stage += 1
       elif self.level < len(self._force_ranges) - 1:
         self.level += 1
@@ -596,10 +618,10 @@ class RlBoyRecoveryAssist:
     ) * self._recovery_probability + alpha * target_probability
 
   def _base_recovery_probability(self) -> float:
-    if self.pose_stage < 2:
+    if self.pose_stage < len(self._recovery_stage_probabilities) - 1:
       return self._recovery_stage_probabilities[self.pose_stage]
     if self.level == 0:
-      return self._recovery_stage_probabilities[2]
+      return self._recovery_stage_probabilities[-1]
     if self.level >= len(self._force_ranges) - 2:
       return self._low_force_recovery_probability
     return self._post_stage_recovery_probability
@@ -612,7 +634,7 @@ class RlBoyRecoveryAssist:
     actual_mean = (
       self.applied_force * self.assist_active.float()
     ).sum() / recovery_count
-    return {
+    state = {
       "level": torch.tensor(self.level, device=self._env.device),
       "pose_stage": torch.tensor(self.pose_stage, device=self._env.device),
       "force_n": force_range.mean(),
@@ -630,10 +652,10 @@ class RlBoyRecoveryAssist:
       "angle_noise_scale": torch.tensor(
         self._angle_noise_scale(), device=self._env.device
       ),
-      "getup_samples": self.source_samples[0],
-      "fall_samples": self.source_samples[1],
-      "canonical_samples": self.source_samples[2],
     }
+    for index, source_name in enumerate(self._source_names):
+      state[f"{source_name}_samples"] = self.source_samples[index]
+    return state
 
 
 def _get_assist(env: ManagerBasedRlEnv, event_name: str) -> RlBoyRecoveryAssist:
